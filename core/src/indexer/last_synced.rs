@@ -192,7 +192,8 @@ pub async fn get_last_synced_block_number(config: SyncConfig<'_>) -> Option<U64>
             config.network
         );
 
-        let row = clickhouse.query_one::<LastBlock>(&query).await;
+        let client = clickhouse.raw_connection().await.expect("Failed to get clickhouse client");
+        let row = client.query(&query).fetch_one::<LastBlock>().await;
 
         return match row {
             Ok(row) => {

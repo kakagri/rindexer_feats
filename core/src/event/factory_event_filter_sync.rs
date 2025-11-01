@@ -261,6 +261,9 @@ pub enum GetKnownFactoryDeployedAddressesError {
 
     #[error("Could not read addresses from clickhouse: {0}")]
     ClickhouseRead(#[from] clickhouse::error::Error),
+
+    #[error("Could not get clickhouse client: {0}")]
+    ClickhouseClient(#[from] ClickhouseError),
 }
 
 #[derive(Clone)]
@@ -340,8 +343,9 @@ pub async fn get_known_factory_deployed_addresses(
             factory_deployed_address: String,
         }
 
+        let client = database.raw_connection().await?;
         let result: Vec<FactoryDeployedAddresses> =
-            database.conn.query(&query).bind(params.network.clone()).fetch_all().await?;
+            client.query(&query).bind(params.network.clone()).fetch_all().await?;
 
         let values = result
             .into_iter()
