@@ -9,7 +9,3 @@ members = [
     "examples/clickhouse_factory_indexing",
     "examples/rindexer_factory_indexing"
 ]
-
-[patch.'https://github.com/kakagri/bb8_features']
-bb8 = "0.9"
-clickhouse = { version = "0.14", features = ["rustls-tls", "lz4"] }

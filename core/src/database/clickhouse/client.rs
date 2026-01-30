@@ -1,6 +1,5 @@
 use crate::EthereumSqlTypeWrapper;
-use bb8::{Pool, RunError};
-use bb8_clickhouse::ClickHouseConnectionManager;
+use clickhouse::Client;
 use dotenv::dotenv;
 use std::env;
 use tracing::info;
@@ -32,27 +31,21 @@ pub enum ClickhouseConnectionError {
 
     #[error("Could not connect to clickhouse database: {0}")]
     ClickhouseNetworkError(#[from] clickhouse::error::Error),
-
-    #[error("Connection pool error: {0}")]
-    ConnectionPoolRuntimeError(#[from] RunError<clickhouse::error::Error>),
 }
 
 #[derive(thiserror::Error, Debug)]
 pub enum ClickhouseError {
     #[error("ClickhouseError: {0}")]
     ClickhouseError(#[from] clickhouse::error::Error),
-
-    #[error("Connection pool error: {0}")]
-    ConnectionPoolError(#[from] RunError<clickhouse::error::Error>),
 }
 
 pub struct ClickhouseClient {
-    pool: Pool<ClickHouseConnectionManager>,
+    conn: Client,
     pub(crate) database_name: String,
 }
 
 impl ClickhouseClient {
-    /// Creates a new ClickHouse client with connection pooling using environment variables.
+    /// Creates a new ClickHouse client using environment variables.
     ///
     /// Expects the following environment variables:
     /// - CLICKHOUSE_URL: The ClickHouse server URL
@@ -63,31 +56,17 @@ impl ClickhouseClient {
         let connection = clickhouse_connection()?;
         let database_name = connection.db.clone();
 
-        let manager = ClickHouseConnectionManager::new(connection.url)
+        let conn = Client::default()
+            .with_url(connection.url)
             .with_database(connection.db)
             .with_user(connection.user)
             .with_password(connection.password);
 
-        let pool = Pool::builder().build(manager).await?;
-
         // Test the connection
-        {
-            let client = pool.get().await?;
-            client.query("SELECT 1").execute().await?;
-        }
+        conn.query("SELECT 1").execute().await?;
         info!("Clickhouse client connected successfully!");
 
-        Ok(ClickhouseClient { pool, database_name })
-    }
-
-    /// Creates a ClickHouse client from an existing connection pool.
-    ///
-    /// This allows for custom pool configuration by building the pool externally.
-    pub async fn from_connection(
-        pool: Pool<ClickHouseConnectionManager>,
-        database_name: String,
-    ) -> Result<Self, ClickhouseConnectionError> {
-        Ok(Self { pool, database_name })
+        Ok(ClickhouseClient { conn, database_name })
     }
 
     /// Returns the name of the database this client is connected to.
@@ -100,9 +79,7 @@ impl ClickhouseClient {
     /// Useful for DDL statements (CREATE, DROP, ALTER) or DML statements where
     /// you don't need to retrieve results.
     pub async fn execute(&self, sql: &str) -> Result<(), ClickhouseError> {
-        let client = self.pool.get().await?;
-        client.query(sql).execute().await?;
-
+        self.conn.query(sql).execute().await?;
         Ok(())
     }
 
@@ -160,12 +137,11 @@ impl ClickhouseClient {
         self.bulk_insert_via_query(table_name, column_names, bulk_data).await
     }
 
-    /// Returns a raw pooled connection to the ClickHouse database.
+    /// Returns a reference to the underlying ClickHouse client.
     ///
-    /// This provides direct access to the underlying clickhouse::Client for operations
+    /// This provides direct access to the clickhouse::Client for operations
     /// that require more control or are not exposed through the ClickhouseClient API.
-    pub async fn raw_connection(&self) -> Result<bb8::PooledConnection<'_, ClickHouseConnectionManager>, ClickhouseError> {
-        let client = self.pool.get().await?;
-        Ok(client)
+    pub fn raw_connection(&self) -> &Client {
+        &self.conn
     }
 }

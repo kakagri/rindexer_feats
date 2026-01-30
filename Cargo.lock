@@ -2184,16 +2184,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "bb8-clickhouse"
-version = "0.1.0"
-source = "git+https://github.com/kakagri/bb8_features#5b7caf1b7bba918a11f3bba9d90120db324f19fd"
-dependencies = [
- "bb8",
- "clickhouse",
- "tokio",
-]
-
-[[package]]
 name = "bb8-postgres"
 version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -10893,7 +10883,6 @@ dependencies = [
  "aws-sdk-sns",
  "axum",
  "bb8",
- "bb8-clickhouse",
  "bb8-postgres",
  "bb8-redis",
  "bincode 2.0.1",

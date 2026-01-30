@@ -1462,6 +1462,12 @@ fn map_dynamic_uint_to_ethereum_sql_type_wrapper(
     abi_input: &ABIInput,
     value: &U256,
 ) -> EthereumSqlTypeWrapper {
+    // Filter: if ABI type is bytes (e.g., bytes32) but decoded as Uint, convert to Bytes
+    if abi_input.type_.starts_with("bytes") && !abi_input.type_.ends_with("[]") {
+        let bytes = value.to_be_bytes::<32>();
+        return EthereumSqlTypeWrapper::Bytes(Bytes::from(bytes.to_vec()));
+    }
+
     let sql_type_wrapper = solidity_type_to_ethereum_sql_type_wrapper(&abi_input.type_);
     if let Some(target_type) = sql_type_wrapper {
         convert_uint(value, &target_type)

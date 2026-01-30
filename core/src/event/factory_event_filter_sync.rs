@@ -343,7 +343,7 @@ pub async fn get_known_factory_deployed_addresses(
             factory_deployed_address: String,
         }
 
-        let client = database.raw_connection().await?;
+        let client = database.raw_connection();
         let result: Vec<FactoryDeployedAddresses> =
             client.query(&query).bind(params.network.clone()).fetch_all().await?;
 

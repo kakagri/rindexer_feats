@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::Path;
 use tracing::{error, info};
 
@@ -8,6 +9,33 @@ use crate::{
     types::code::Code,
 };
 
+/// List of field names that should be included in ORDER BY (case-insensitive).
+/// These are common DeFi field names that are frequently used for filtering.
+const ORDER_BY_FIELD_NAMES: &[&str] = &[
+    "onbehalf",
+    "onbehalfof",
+    "caller",
+    "user",
+    "sender",
+    "receiver",
+    "from",
+    "to",
+    "asset",
+    "collateralasset",
+    "collateraltoken",
+    "debtasset",
+    "debttoken",
+    "reserve",
+    "debtreserve",
+    "collateralreserve",
+    "market",
+    "marketid",
+    "id",
+    "repaytoken",
+    "liquidator",
+    "receiveraddress",
+];
+
 use crate::database::generate::{
     generate_indexer_contract_schema_name, generate_internal_factory_event_table_name,
     generate_internal_factory_event_table_name_no_shorten, GenerateTablesForIndexerSqlError,
@@ -16,6 +44,83 @@ use crate::database::postgres::generate::{
     generate_internal_event_table_name_no_shorten, GenerateInternalFactoryEventTableNameParams,
 };
 use crate::manifest::contract::FactoryDetailsYaml;
+
+/// Recursively collects fields that should be included in ORDER BY.
+/// Indexed fields are collected separately from named fields to maintain ordering priority.
+fn collect_order_by_fields(
+    inputs: &[ABIInput],
+    prefix: Option<&str>,
+    indexed_fields: &mut Vec<String>,
+    named_fields: &mut Vec<String>,
+) {
+    for input in inputs {
+        // Handle nested tuples recursively
+        if let Some(components) = &input.components {
+            let new_prefix = match prefix {
+                Some(p) => format!("{}_{}", p, camel_to_snake(&input.name)),
+                None => camel_to_snake(&input.name),
+            };
+            collect_order_by_fields(components, Some(&new_prefix), indexed_fields, named_fields);
+        } else {
+            let column_name = match prefix {
+                Some(p) => format!("{}_{}", p, camel_to_snake(&input.name)),
+                None => camel_to_snake(&input.name),
+            };
+
+            let is_indexed = input.indexed.unwrap_or(false);
+            let name_lower = input.name.to_lowercase();
+            let matches_named = ORDER_BY_FIELD_NAMES.contains(&name_lower.as_str());
+
+            if is_indexed {
+                indexed_fields.push(column_name);
+            } else if matches_named {
+                // Only add to named_fields if not already indexed (to avoid duplicates)
+                named_fields.push(column_name);
+            }
+        }
+    }
+}
+
+/// Generates the ORDER BY clause fields for a ClickHouse event table.
+/// Structure: network, block_number, log_index, indexed_fields..., named_fields..., tx_hash
+fn generate_order_by_fields(inputs: &[ABIInput]) -> String {
+    let mut indexed_fields = Vec::new();
+    let mut named_fields = Vec::new();
+
+    collect_order_by_fields(inputs, None, &mut indexed_fields, &mut named_fields);
+
+    // Track which fields have been added to avoid duplicates
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut order_parts = Vec::new();
+
+    // Add base fields first: network, block_number, log_index
+    for base_field in ["network", "block_number", "log_index"] {
+        order_parts.push(base_field.to_string());
+        seen.insert(base_field.to_string());
+    }
+
+    // Reserve tx_hash for the end (mark as seen so it's not added in indexed/named sections)
+    seen.insert("tx_hash".to_string());
+
+    // Add indexed fields (skip if already in base fields)
+    for field in indexed_fields {
+        if seen.insert(field.clone()) {
+            order_parts.push(field);
+        }
+    }
+
+    // Add named fields (skip if already added as indexed or base)
+    for field in named_fields {
+        if seen.insert(field.clone()) {
+            order_parts.push(field);
+        }
+    }
+
+    // Add tx_hash at the end
+    order_parts.push("tx_hash".to_string());
+
+    order_parts.join(", ")
+}
 
 pub fn generate_tables_for_indexer_clickhouse(
     project_path: &Path,
@@ -77,6 +182,9 @@ fn generate_event_table_clickhouse(
                 generate_columns_with_data_types(&event_info.inputs).join(", ") + ","
             };
 
+            // Generate dynamic ORDER BY fields based on indexed fields and named fields
+            let order_by_fields = generate_order_by_fields(&event_info.inputs);
+
             let create_table_sql = format!(
                 r#"CREATE TABLE IF NOT EXISTS {} (
                     contract_address FixedString(42),
@@ -95,8 +203,8 @@ fn generate_event_table_clickhouse(
                     index idx_tx_hash (tx_hash) type bloom_filter granularity 1
                 )
                 ENGINE = ReplacingMergeTree
-                ORDER BY (network, block_number, tx_hash, log_index);"#,
-                table_name, event_columns
+                ORDER BY ({});"#,
+                table_name, event_columns, order_by_fields
             );
 
             create_table_sql
@@ -342,5 +450,103 @@ pub fn solidity_type_to_clickhouse_type(abi_type: &str) -> String {
         format!("Array({})", sql_type)
     } else {
         sql_type.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_input(name: &str, type_: &str, indexed: Option<bool>) -> ABIInput {
+        ABIInput { name: name.to_string(), type_: type_.to_string(), indexed, components: None }
+    }
+
+    #[test]
+    fn test_generate_order_by_fields_with_indexed() {
+        // event Supply(Id indexed id, address indexed caller, address indexed onBehalf, uint256 assets, uint256 shares)
+        let inputs = vec![
+            make_input("id", "uint256", Some(true)),
+            make_input("caller", "address", Some(true)),
+            make_input("onBehalf", "address", Some(true)),
+            make_input("assets", "uint256", Some(false)),
+            make_input("shares", "uint256", Some(false)),
+        ];
+
+        let result = generate_order_by_fields(&inputs);
+        assert_eq!(result, "network, block_number, log_index, id, caller, on_behalf, tx_hash");
+    }
+
+    #[test]
+    fn test_generate_order_by_fields_with_named_fields() {
+        // Event with non-indexed fields that match the named list
+        let inputs = vec![
+            make_input("amount", "uint256", Some(false)),
+            make_input("sender", "address", Some(false)),
+            make_input("receiver", "address", Some(false)),
+        ];
+
+        let result = generate_order_by_fields(&inputs);
+        assert_eq!(result, "network, block_number, log_index, sender, receiver, tx_hash");
+    }
+
+    #[test]
+    fn test_generate_order_by_fields_case_insensitive() {
+        // Test case-insensitive matching: OnBehalf, SENDER, User
+        let inputs = vec![
+            make_input("OnBehalf", "address", Some(false)),
+            make_input("SENDER", "address", Some(false)),
+            make_input("User", "address", Some(false)),
+        ];
+
+        let result = generate_order_by_fields(&inputs);
+        assert_eq!(result, "network, block_number, log_index, on_behalf, sender, user, tx_hash");
+    }
+
+    #[test]
+    fn test_generate_order_by_fields_no_duplicates_indexed_and_named() {
+        // Field is both indexed AND matches named list - should only appear once
+        let inputs = vec![
+            make_input("caller", "address", Some(true)), // indexed AND in named list
+            make_input("amount", "uint256", Some(false)),
+        ];
+
+        let result = generate_order_by_fields(&inputs);
+        assert_eq!(result, "network, block_number, log_index, caller, tx_hash");
+    }
+
+    #[test]
+    fn test_generate_order_by_fields_no_duplicates_base_fields() {
+        // Event field named same as base field - should not duplicate
+        let inputs = vec![
+            make_input("network", "string", Some(true)),  // same as base field
+            make_input("tx_hash", "bytes32", Some(true)), // same as base field
+            make_input("caller", "address", Some(true)),
+        ];
+
+        let result = generate_order_by_fields(&inputs);
+        // network and tx_hash should NOT be duplicated
+        assert_eq!(result, "network, block_number, log_index, caller, tx_hash");
+    }
+
+    #[test]
+    fn test_generate_order_by_fields_empty_inputs() {
+        let inputs: Vec<ABIInput> = vec![];
+
+        let result = generate_order_by_fields(&inputs);
+        assert_eq!(result, "network, block_number, log_index, tx_hash");
+    }
+
+    #[test]
+    fn test_generate_order_by_fields_indexed_before_named() {
+        // Verify indexed fields come before named fields
+        let inputs = vec![
+            make_input("sender", "address", Some(false)),    // named (not indexed)
+            make_input("id", "uint256", Some(true)),         // indexed
+            make_input("receiver", "address", Some(false)),  // named (not indexed)
+        ];
+
+        let result = generate_order_by_fields(&inputs);
+        // id (indexed) should come before sender and receiver (named)
+        assert_eq!(result, "network, block_number, log_index, id, sender, receiver, tx_hash");
     }
 }
