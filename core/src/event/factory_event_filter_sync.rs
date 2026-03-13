@@ -469,8 +469,12 @@ pub async fn get_factory_addresses_with_birth_blocks(
             r#"SELECT toString({address_column}) AS address, block_number FROM {schema_name}.{table_name} FINAL WHERE network = ?"#
         );
 
-        let result: Vec<AddressWithBlock> =
-            database.conn.query(&query).bind(params.network.clone()).fetch_all().await?;
+        let result: Vec<AddressWithBlock> = database
+            .raw_connection()
+            .query(&query)
+            .bind(params.network.clone())
+            .fetch_all()
+            .await?;
 
         let values: HashMap<Address, u64> = result
             .into_iter()

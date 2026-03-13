@@ -621,7 +621,7 @@ mod tests {
     fn test_generate_order_by_fields_no_duplicates_base_fields() {
         // Event field named same as base field - should not duplicate
         let inputs = vec![
-            make_input("network", "string", Some(true)),  // same as base field
+            make_input("network", "string", Some(true)), // same as base field
             make_input("tx_hash", "bytes32", Some(true)), // same as base field
             make_input("caller", "address", Some(true)),
         ];
@@ -643,9 +643,9 @@ mod tests {
     fn test_generate_order_by_fields_indexed_before_named() {
         // Verify indexed fields come before named fields
         let inputs = vec![
-            make_input("sender", "address", Some(false)),    // named (not indexed)
-            make_input("id", "uint256", Some(true)),         // indexed
-            make_input("receiver", "address", Some(false)),  // named (not indexed)
+            make_input("sender", "address", Some(false)), // named (not indexed)
+            make_input("id", "uint256", Some(true)),      // indexed
+            make_input("receiver", "address", Some(false)), // named (not indexed)
         ];
 
         let result = generate_order_by_fields(&inputs);
