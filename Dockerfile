@@ -14,7 +14,7 @@ WORKDIR /app
 COPY . .
 
 # Build for standard Linux (glibc) instead of musl
-RUN RUSTFLAGS='-C target-cpu=native' cargo build --release --features jemalloc,reth --workspace --exclude rindexer_rust_playground
+RUN cargo build --release --features jemalloc,reth --workspace --exclude rindexer_rust_playground
 
 FROM --platform=linux/amd64 debian:bookworm-slim
 RUN apt-get update && apt-get install -y \
@@ -27,11 +27,9 @@ RUN apt-get update && apt-get install -y \
 RUN curl -L https://foundry.paradigm.xyz | bash
 RUN /root/.foundry/bin/foundryup
 
-# Copy the entire project directory
-COPY --from=builder /app /app/
+# Copy only the binary
+COPY --from=builder /app/target/release/rindexer_cli /usr/local/bin/rindexer_cli
 # Copy SSL certificates
 COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
 
-WORKDIR /app
-
-CMD ["/app/target/release/rindexer_cli"]
+CMD ["rindexer_cli"]

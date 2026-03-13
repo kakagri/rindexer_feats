@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{sync::Arc, time::Instant};
 
 use aws_sdk_sns::{config::http::HttpResponse, error::SdkError, operation::publish::PublishError};
 use futures::future::join_all;
@@ -8,22 +8,26 @@ use tokio::{
     task,
     task::{JoinError, JoinHandle},
 };
-use tracing::error;
 
 use crate::{
     event::{filter_event_data_by_conditions, EventMessage},
     indexer::native_transfer::EVENT_NAME,
     manifest::stream::{
-        CloudflareQueuesStreamConfig, CloudflareQueuesStreamQueueConfig, KafkaStreamConfig,
-        KafkaStreamQueueConfig, RabbitMQStreamConfig, RabbitMQStreamQueueConfig, RedisStreamConfig,
-        RedisStreamStreamConfig, SNSStreamTopicConfig, StreamEvent, StreamsConfig,
-        WebhookStreamConfig,
+        CloudflareQueuesStreamConfig, CloudflareQueuesStreamQueueConfig, RabbitMQStreamConfig,
+        RabbitMQStreamQueueConfig, RedisStreamConfig, RedisStreamStreamConfig,
+        SNSStreamTopicConfig, StreamEvent, StreamsConfig, WebhookStreamConfig,
     },
+    metrics::streams::{self as stream_metrics, stream_type},
     streams::{
-        kafka::{Kafka, KafkaError},
         CloudflareQueues, CloudflareQueuesError, RabbitMQ, RabbitMQError, Redis, RedisError,
         Webhook, WebhookError, SNS,
     },
+};
+
+#[cfg(feature = "kafka")]
+use crate::{
+    manifest::stream::{KafkaStreamConfig, KafkaStreamQueueConfig},
+    streams::kafka::{Kafka, KafkaError},
 };
 
 // we should limit the max chunk size we send over when streaming to 70KB - 100KB is most limits
@@ -50,6 +54,7 @@ pub enum StreamError {
     #[error("RabbitMQ could not publish: {0}")]
     RabbitMQCouldNotPublish(#[from] RabbitMQError),
 
+    #[cfg(feature = "kafka")]
     #[error("Kafka could not publish: {0}")]
     KafkaCouldNotPublish(#[from] KafkaError),
 
@@ -75,6 +80,7 @@ pub struct RabbitMQStream {
     client: Arc<RabbitMQ>,
 }
 
+#[cfg(feature = "kafka")]
 #[derive(Debug)]
 pub struct KafkaStream {
     config: KafkaStreamConfig,
@@ -98,6 +104,7 @@ pub struct StreamsClients {
     sns: Option<SNSStream>,
     webhook: Option<WebhookStream>,
     rabbitmq: Option<RabbitMQStream>,
+    #[cfg(feature = "kafka")]
     kafka: Option<KafkaStream>,
     redis: Option<RedisStream>,
     cloudflare_queues: Option<CloudflareQueuesStream>,
@@ -131,6 +138,7 @@ impl StreamsClients {
             None
         };
 
+        #[cfg(feature = "kafka")]
         #[allow(clippy::manual_map)]
         let kafka = if let Some(config) = stream_config.kafka.as_ref() {
             Some(KafkaStream {
@@ -172,14 +180,31 @@ impl StreamsClients {
             None
         };
 
-        Self { sns, webhook, rabbitmq, kafka, redis, cloudflare_queues }
+        Self {
+            sns,
+            webhook,
+            rabbitmq,
+            #[cfg(feature = "kafka")]
+            kafka,
+            redis,
+            cloudflare_queues,
+        }
     }
 
     fn has_any_streams(&self) -> bool {
         self.sns.is_some()
             || self.webhook.is_some()
             || self.rabbitmq.is_some()
-            || self.kafka.is_some()
+            || {
+                #[cfg(feature = "kafka")]
+                {
+                    self.kafka.is_some()
+                }
+                #[cfg(not(feature = "kafka"))]
+                {
+                    false
+                }
+            }
             || self.redis.is_some()
             || self.cloudflare_queues.is_some()
     }
@@ -322,10 +347,21 @@ impl StreamsClients {
                 let publish_message =
                     self.create_chunk_message_raw(&config.events, event_message, &filtered_chunk);
                 task::spawn(async move {
-                    let _ =
-                        client.publish(&publish_message_id, &topic_arn, &publish_message).await?;
+                    let start = Instant::now();
+                    let result =
+                        client.publish(&publish_message_id, &topic_arn, &publish_message).await;
+                    let duration = start.elapsed().as_secs_f64();
+                    let count = filtered_chunk.len();
 
-                    Ok(filtered_chunk.len())
+                    stream_metrics::record_stream_operation(
+                        stream_type::SNS,
+                        result.is_ok(),
+                        duration,
+                        count,
+                    );
+
+                    result?;
+                    Ok(count)
                 })
             })
             .collect();
@@ -358,11 +394,22 @@ impl StreamsClients {
                 let publish_message =
                     self.create_chunk_message_json(&config.events, event_message, &filtered_chunk);
                 task::spawn(async move {
-                    client
+                    let start = Instant::now();
+                    let result = client
                         .publish(&publish_message_id, &endpoint, &shared_secret, &publish_message)
-                        .await?;
+                        .await;
+                    let duration = start.elapsed().as_secs_f64();
+                    let count = filtered_chunk.len();
 
-                    Ok(filtered_chunk.len())
+                    stream_metrics::record_stream_operation(
+                        stream_type::WEBHOOK,
+                        result.is_ok(),
+                        duration,
+                        count,
+                    );
+
+                    result?;
+                    Ok(count)
                 })
             })
             .collect();
@@ -397,7 +444,8 @@ impl StreamsClients {
                     self.create_chunk_message_json(&config.events, event_message, &filtered_chunk);
 
                 task::spawn(async move {
-                    client
+                    let start = Instant::now();
+                    let result = client
                         .publish(
                             &publish_message_id,
                             &exchange,
@@ -405,14 +453,26 @@ impl StreamsClients {
                             &routing_key,
                             &publish_message,
                         )
-                        .await?;
-                    Ok(filtered_chunk.len())
+                        .await;
+                    let duration = start.elapsed().as_secs_f64();
+                    let count = filtered_chunk.len();
+
+                    stream_metrics::record_stream_operation(
+                        stream_type::RABBITMQ,
+                        result.is_ok(),
+                        duration,
+                        count,
+                    );
+
+                    result?;
+                    Ok(count)
                 })
             })
             .collect();
         tasks
     }
 
+    #[cfg(feature = "kafka")]
     fn kafka_stream_tasks(
         &self,
         config: &KafkaStreamQueueConfig,
@@ -438,10 +498,22 @@ impl StreamsClients {
                 let publish_message =
                     self.create_chunk_message_json(&config.events, event_message, &filtered_chunk);
                 task::spawn(async move {
-                    client
+                    let start = Instant::now();
+                    let result = client
                         .publish(&publish_message_id, &exchange, &routing_key, &publish_message)
-                        .await?;
-                    Ok(filtered_chunk.len())
+                        .await;
+                    let duration = start.elapsed().as_secs_f64();
+                    let count = filtered_chunk.len();
+
+                    stream_metrics::record_stream_operation(
+                        stream_type::KAFKA,
+                        result.is_ok(),
+                        duration,
+                        count,
+                    );
+
+                    result?;
+                    Ok(count)
                 })
             })
             .collect();
@@ -473,8 +545,21 @@ impl StreamsClients {
                     self.create_chunk_message_json(&config.events, event_message, &filtered_chunk);
 
                 task::spawn(async move {
-                    client.publish(&publish_message_id, &stream_name, &publish_message).await?;
-                    Ok(filtered_chunk.len())
+                    let start = Instant::now();
+                    let result =
+                        client.publish(&publish_message_id, &stream_name, &publish_message).await;
+                    let duration = start.elapsed().as_secs_f64();
+                    let count = filtered_chunk.len();
+
+                    stream_metrics::record_stream_operation(
+                        stream_type::REDIS,
+                        result.is_ok(),
+                        duration,
+                        count,
+                    );
+
+                    result?;
+                    Ok(count)
                 })
             })
             .collect();
@@ -506,8 +591,21 @@ impl StreamsClients {
                     self.create_chunk_message_json(&config.events, event_message, &filtered_chunk);
 
                 task::spawn(async move {
-                    client.publish(&publish_message_id, &queue_id, &publish_message).await?;
-                    Ok(filtered_chunk.len())
+                    let start = Instant::now();
+                    let result =
+                        client.publish(&publish_message_id, &queue_id, &publish_message).await;
+                    let duration = start.elapsed().as_secs_f64();
+                    let count = filtered_chunk.len();
+
+                    stream_metrics::record_stream_operation(
+                        stream_type::CLOUDFLARE_QUEUES,
+                        result.is_ok(),
+                        duration,
+                        count,
+                    );
+
+                    result?;
+                    Ok(count)
                 })
             })
             .collect();
@@ -581,6 +679,7 @@ impl StreamsClients {
                 }
             }
 
+            #[cfg(feature = "kafka")]
             if let Some(kafka) = &self.kafka {
                 for config in &kafka.config.topics {
                     if config.events.iter().any(|e| e.event_name == event_message.event_name)

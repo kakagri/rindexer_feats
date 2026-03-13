@@ -48,6 +48,26 @@ pub fn generate_internal_event_table_name_no_shorten(
     format!("{}_{}", schema_name, camel_to_snake(event_name))
 }
 
+/// Generate internal table name for tracking cron sync state.
+/// Format: {schema_name}_{table_name}_cron_{cron_index}
+pub fn generate_internal_cron_table_name(
+    schema_name: &str,
+    table_name: &str,
+    cron_index: usize,
+) -> String {
+    let table_name = format!("{}_{}_cron_{}", schema_name, camel_to_snake(table_name), cron_index);
+    compact_table_name_if_needed(table_name)
+}
+
+/// Generate internal table name for tracking cron sync state (without shortening).
+pub fn generate_internal_cron_table_name_no_shorten(
+    schema_name: &str,
+    table_name: &str,
+    cron_index: usize,
+) -> String {
+    format!("{}_{}_cron_{}", schema_name, camel_to_snake(table_name), cron_index)
+}
+
 pub struct GenerateInternalFactoryEventTableNameParams {
     pub indexer_name: String,
     pub contract_name: String,
@@ -59,6 +79,12 @@ pub struct GenerateInternalFactoryEventTableNameParams {
 pub fn solidity_type_to_db_type(abi_type: &str) -> String {
     let is_array = abi_type.ends_with("[]");
     let base_type = abi_type.trim_end_matches("[]");
+
+    // Handle tuple arrays as JSONB (both dynamic tuple[] and fixed-size tuple[N])
+    // Arrays of tuples cannot be flattened into columns since array length varies
+    if abi_type.starts_with("tuple[") {
+        return "JSONB".to_string();
+    }
 
     let sql_type = match base_type {
         "address" => "CHAR(42)",

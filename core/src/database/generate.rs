@@ -1,13 +1,13 @@
 use crate::abi::{EventInfo, ParamTypeError, ReadAbiError};
 use crate::database::postgres::client::PostgresError;
 use crate::database::postgres::generate::{
-    generate_columns_with_data_types, generate_internal_event_table_name,
-    GenerateInternalFactoryEventTableNameParams,
+    generate_columns_with_data_types, generate_internal_cron_table_name,
+    generate_internal_event_table_name, GenerateInternalFactoryEventTableNameParams,
 };
-use crate::helpers::camel_to_snake;
+use crate::helpers::{camel_to_snake, snake_to_camel};
 use crate::indexer::native_transfer::{NATIVE_TRANSFER_ABI, NATIVE_TRANSFER_CONTRACT_NAME};
 use crate::indexer::Indexer;
-use crate::manifest::contract::{Contract, FactoryDetailsYaml};
+use crate::manifest::contract::{injected_columns, Contract, FactoryDetailsYaml, Table};
 use crate::types::code::Code;
 use crate::ABIItem;
 use alloy::primitives::keccak256;
@@ -50,11 +50,10 @@ fn generate_event_table_sql_with_comments(
                 return create_table_sql;
             }
 
-            // smart comments needed to avoid clashing of order by graphql names
-            let table_comment = format!(
-                "COMMENT ON TABLE {} IS E'@name {}{}';",
-                table_name, contract_name, event_info.name
-            );
+            // smart comments needed to avoid clashing of graphql type names
+            let graphql_name = format!("{}{}", contract_name, event_info.name);
+            let table_comment =
+                format!("COMMENT ON TABLE {} IS E'@name {}';", table_name, graphql_name);
 
             format!("{create_table_sql}\n{table_comment}")
         })
@@ -105,12 +104,61 @@ fn generate_internal_event_table_sql(
 
         let latest_block_insert_queries = networks.iter().map(|network| {
             format!(
-                r#"INSERT INTO rindexer_internal.latest_block ("network", "block") VALUES ("{network}", 0) ON CONFLICT ("network") DO NOTHING;"#
+                r#"INSERT INTO rindexer_internal.latest_block ("network", "block") VALUES ('{network}', 0) ON CONFLICT ("network") DO NOTHING;"#
             )
         }).collect::<Vec<_>>().join("\n");
 
         format!("{create_table_query}\n{insert_queries}\n{create_latest_block_query}\n{latest_block_insert_queries}")
     }).collect::<Vec<_>>().join("\n")
+}
+
+/// Generate SQL for internal cron sync state tracking tables.
+/// Creates a table per cron entry in each table to track the last synced block.
+fn generate_internal_cron_table_sql(
+    tables: &[Table],
+    schema_name: &str,
+    networks: Vec<&str>,
+) -> String {
+    let mut sql_statements = Vec::new();
+
+    for table in tables.iter().filter(|t| t.has_cron()) {
+        let cron_entries = table.cron.as_ref().unwrap();
+
+        for (cron_index, cron) in cron_entries.iter().enumerate() {
+            // Only generate for cron entries with start_block (historical sync)
+            if cron.start_block.is_none() {
+                continue;
+            }
+
+            let internal_table_name =
+                generate_internal_cron_table_name(schema_name, &table.name, cron_index);
+
+            let create_table_query = format!(
+                r#"CREATE TABLE IF NOT EXISTS rindexer_internal.{internal_table_name} ("network" TEXT PRIMARY KEY, "last_synced_block" NUMERIC);"#
+            );
+
+            // Determine which networks this cron runs on
+            let cron_networks: Vec<&str> = if let Some(network) = &cron.network {
+                vec![network.as_str()]
+            } else {
+                networks.clone()
+            };
+
+            let insert_queries = cron_networks
+                .iter()
+                .map(|network| {
+                    format!(
+                        r#"INSERT INTO rindexer_internal.{internal_table_name} ("network", "last_synced_block") VALUES ('{network}', 0) ON CONFLICT ("network") DO NOTHING;"#
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+
+            sql_statements.push(format!("{create_table_query}\n{insert_queries}"));
+        }
+    }
+
+    sql_statements.join("\n")
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -123,6 +171,121 @@ pub enum GenerateTablesForIndexerSqlError {
 
     #[error("failed to execute {0}")]
     Postgres(#[from] PostgresError),
+}
+
+/// Generate SQL for custom tables
+fn generate_tables_sql(
+    tables: &[Table],
+    contract_name: &str,
+    schema_name: &str,
+    clashing_table_names: &[String],
+) -> String {
+    tables
+        .iter()
+        .map(|table| {
+            let table_name = format!("{}.{}", schema_name, camel_to_snake(&table.name));
+            info!("Creating custom table if not exists: {}", table_name);
+
+            // Build column definitions
+            let mut columns: Vec<String> = vec![];
+
+            // Add network column (part of primary key unless cross_chain is true)
+            if !table.cross_chain {
+                columns.push("network VARCHAR(50) NOT NULL".to_string());
+            }
+
+            // Add user-defined columns
+            for column in &table.columns {
+                let column_type = column.resolved_type().to_postgres_type();
+                let mut column_def = format!("\"{}\" {}", column.name, column_type);
+
+                // Add NOT NULL constraint by default (unless nullable: true is set)
+                if !column.nullable {
+                    column_def.push_str(" NOT NULL");
+                }
+
+                if let Some(default) = &column.default {
+                    // Handle default values - numeric values don't need quotes
+                    let default_value = if column_type == "NUMERIC"
+                        || column_type == "BIGINT"
+                        || column_type == "BOOLEAN"
+                    {
+                        default.clone()
+                    } else {
+                        format!("'{}'", default.replace('\'', "''"))
+                    };
+                    column_def.push_str(&format!(" DEFAULT {}", default_value));
+                }
+
+                columns.push(column_def);
+            }
+
+            // Auto-injected metadata columns (always populated by rindexer, no defaults needed)
+            columns.push(format!("\"{}\" BIGINT NOT NULL", injected_columns::BLOCK_NUMBER));
+            // Only add block timestamp column if table.timestamp is true
+            if table.timestamp {
+                columns.push(format!(
+                    "\"{}\" TIMESTAMPTZ NOT NULL",
+                    injected_columns::BLOCK_TIMESTAMP
+                ));
+            }
+            columns.push(format!("\"{}\" CHAR(66) NOT NULL", injected_columns::TX_HASH));
+            columns.push(format!("\"{}\" CHAR(66) NOT NULL", injected_columns::BLOCK_HASH));
+            columns.push(format!("\"{}\" CHAR(42) NOT NULL", injected_columns::CONTRACT_ADDRESS));
+            columns
+                .push(format!("\"{}\" NUMERIC NOT NULL", injected_columns::RINDEXER_SEQUENCE_ID));
+
+            // For insert-only tables, add auto-incrementing ID column
+            if table.is_insert_only() {
+                columns.push(format!("\"{}\" BIGSERIAL", injected_columns::RINDEXER_ID));
+            }
+
+            // Build primary key constraint
+            let mut primary_keys: Vec<String> = vec![];
+            if !table.cross_chain {
+                primary_keys.push("network".to_string());
+            }
+
+            // For insert-only tables, use auto-incrementing rindexer_id as PK
+            // For other tables, use the where clause columns as PK
+            if table.is_insert_only() {
+                primary_keys.push(format!("\"{}\"", injected_columns::RINDEXER_ID));
+            } else {
+                for pk_col in table.primary_key_columns() {
+                    primary_keys.push(format!("\"{}\"", pk_col));
+                }
+            }
+            let primary_key_constraint = format!("PRIMARY KEY ({})", primary_keys.join(", "));
+
+            columns.push(primary_key_constraint);
+
+            let create_table_sql =
+                format!("CREATE TABLE IF NOT EXISTS {} ({});", table_name, columns.join(", "));
+
+            // Add table comment for GraphQL naming
+            // If table name clashes with another contract's table, prefix with contract name
+            let table_comment = if clashing_table_names.contains(&table.name) {
+                let graphql_name = format!("{}{}", contract_name, snake_to_camel(&table.name));
+                format!("COMMENT ON TABLE {} IS E'@name {}';", table_name, graphql_name)
+            } else {
+                let graphql_name = snake_to_camel(&table.name);
+                format!("COMMENT ON TABLE {} IS E'@name {}';", table_name, graphql_name)
+            };
+
+            format!("{}\n{}", create_table_sql, table_comment)
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Generate table name for a custom table
+pub fn generate_table_full_name(
+    indexer_name: &str,
+    contract_name: &str,
+    table_name: &str,
+) -> String {
+    let schema_name = generate_indexer_contract_schema_name(indexer_name, contract_name);
+    format!("{}.{}", schema_name, camel_to_snake(table_name))
 }
 
 /// If any event names match the whole table name should be exposed differently on graphql
@@ -156,6 +319,34 @@ pub fn find_clashing_event_names(
     Ok(clashing_events)
 }
 
+/// Find custom table names that clash across different contracts
+/// to avoid GraphQL type naming conflicts
+pub fn find_clashing_table_names(
+    current_contract_name: &str,
+    current_tables: &[Table],
+    all_contracts: &[Contract],
+) -> Vec<String> {
+    let mut clashing_tables = Vec::new();
+
+    for other_contract in all_contracts {
+        if other_contract.name == current_contract_name {
+            continue;
+        }
+
+        if let Some(other_tables) = &other_contract.tables {
+            for current_table in current_tables {
+                if other_tables.iter().any(|t| t.name == current_table.name)
+                    && !clashing_tables.contains(&current_table.name)
+                {
+                    clashing_tables.push(current_table.name.clone());
+                }
+            }
+        }
+    }
+
+    clashing_tables
+}
+
 pub fn generate_tables_for_indexer_sql(
     project_path: &Path,
     indexer: &Indexer,
@@ -175,26 +366,52 @@ pub fn generate_tables_for_indexer_sql(
             sql.push_str(format!("CREATE SCHEMA IF NOT EXISTS {schema_name};").as_str());
             info!("Creating schema if not exists: {}", schema_name);
 
-            let event_matching_name_on_other = find_clashing_event_names(
-                project_path,
-                &contract_name,
-                &indexer.contracts,
-                &events,
-            )?;
+            // Only create raw event tables for events in include_events (not for table-only events)
+            let raw_events: Vec<_> = events
+                .iter()
+                .filter(|e| contract.is_event_in_include_events(&e.name))
+                .cloned()
+                .collect();
 
-            sql.push_str(&generate_event_table_sql_with_comments(
-                &events,
-                &contract.name,
-                &schema_name,
-                event_matching_name_on_other,
-            ));
+            if !raw_events.is_empty() {
+                let event_matching_name_on_other = find_clashing_event_names(
+                    project_path,
+                    &contract_name,
+                    &indexer.contracts,
+                    &raw_events,
+                )?;
+
+                sql.push_str(&generate_event_table_sql_with_comments(
+                    &raw_events,
+                    &contract.name,
+                    &schema_name,
+                    event_matching_name_on_other,
+                ));
+            }
+
+            // Generate custom tables if defined
+            if let Some(tables) = &contract.tables {
+                let clashing_table_names =
+                    find_clashing_table_names(&contract_name, tables, &indexer.contracts);
+                sql.push_str(&generate_tables_sql(
+                    tables,
+                    &contract.name,
+                    &schema_name,
+                    &clashing_table_names,
+                ));
+            }
         }
 
         // we still need to create the internal tables for the contract
-        sql.push_str(&generate_internal_event_table_sql(&events, &schema_name, networks));
+        sql.push_str(&generate_internal_event_table_sql(&events, &schema_name, networks.clone()));
 
         // generate internal tables for contract factories indexing
         sql.push_str(&generate_internal_factory_event_table_sql(&indexer.name, &factories));
+
+        // generate internal tables for cron sync state tracking
+        if let Some(tables) = &contract.tables {
+            sql.push_str(&generate_internal_cron_table_sql(tables, &schema_name, networks));
+        }
     }
 
     if indexer.native_transfers.enabled {
@@ -375,6 +592,30 @@ pub fn drop_tables_for_indexer_sql(project_path: &Path, indexer: &Indexer) -> Co
             sql.push_str(
                 format!("DROP TABLE IF EXISTS rindexer_internal.{table_name} CASCADE;").as_str(),
             )
+        }
+
+        // drop cron internal tables
+        if let Some(tables) = &contract.tables {
+            for table in tables {
+                if let Some(cron_entries) = &table.cron {
+                    for (cron_index, cron) in cron_entries.iter().enumerate() {
+                        // Only drop tables for crons that have historical sync (start_block)
+                        if cron.start_block.is_some() {
+                            let table_name = generate_internal_cron_table_name(
+                                &schema_name,
+                                &table.name,
+                                cron_index,
+                            );
+                            sql.push_str(
+                                format!(
+                                    "DROP TABLE IF EXISTS rindexer_internal.{table_name} CASCADE;"
+                                )
+                                .as_str(),
+                            );
+                        }
+                    }
+                }
+            }
         }
     }
 

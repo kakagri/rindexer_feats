@@ -1,9 +1,10 @@
 use std::{
+    collections::HashSet,
     env, fs,
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU32, Ordering},
         Arc, Mutex,
     },
     time::Duration,
@@ -12,16 +13,51 @@ use std::{
 use reqwest::{Client, Error};
 use serde_json::{json, Value};
 use tokio::sync::{oneshot, oneshot::Sender};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use crate::{
     database::{
         generate::generate_indexer_contract_schema_name, postgres::client::connection_string,
     },
-    helpers::{kill_process_on_port, set_thread_no_logging},
     indexer::Indexer,
     manifest::graphql::GraphQLSettings,
 };
+
+/// Check if a port is available for binding.
+pub fn is_port_available(port: u16) -> bool {
+    std::net::TcpListener::bind(format!("0.0.0.0:{}", port)).is_ok()
+}
+
+/// Find an available port starting from the given port.
+/// Returns the first available port found.
+pub fn find_available_port(start_port: u16, max_attempts: u16) -> Option<u16> {
+    for offset in 0..max_attempts {
+        let port = start_port.saturating_add(offset);
+        if is_port_available(port) {
+            return Some(port);
+        }
+    }
+    None
+}
+
+/// Check if there are any table name conflicts across contracts.
+/// Returns true if any two contracts have tables with the same name.
+fn has_table_name_conflicts(indexer: &Indexer) -> bool {
+    let mut seen_table_names: HashSet<String> = HashSet::new();
+
+    for contract in &indexer.contracts {
+        if let Some(tables) = &contract.tables {
+            for table in tables {
+                if !seen_table_names.insert(table.name.clone()) {
+                    // Table name already seen in another contract
+                    return true;
+                }
+            }
+        }
+    }
+
+    false
+}
 
 pub struct GraphqlOverrideSettings {
     pub enabled: bool,
@@ -91,9 +127,7 @@ pub async fn start_graphql_server(
         .collect();
 
     let connection_string = connection_string()?;
-    let port = settings.port;
-    let graphql_endpoint = format!("http://localhost:{}/graphql", &port);
-    let graphql_playground = format!("http://localhost:{}/playground", &port);
+    let configured_port = settings.port;
 
     let rindexer_graphql_exe = get_graphql_exe().map_err(|_| {
         StartGraphqlServerError::GraphQLServerStartupError(
@@ -101,8 +135,42 @@ pub async fn start_graphql_server(
         )
     })?;
 
-    // kill any existing process on the port
-    kill_process_on_port(port).map_err(StartGraphqlServerError::GraphQLServerStartupError)?;
+    // Check if port is available, auto-find alternative if not
+    let port = if !is_port_available(configured_port) {
+        warn!("Port {} is already in use, finding an available port...", configured_port);
+        match find_available_port(configured_port + 1, 100) {
+            Some(available_port) => {
+                info!(
+                    "Using port {} instead of configured port {}",
+                    available_port, configured_port
+                );
+                available_port
+            }
+            None => {
+                error!(
+                    "Could not start GraphQL API - port {} is already in use and no alternative port could be found",
+                    configured_port
+                );
+                return Err(StartGraphqlServerError::GraphQLServerStartupError(format!(
+                    "Port {} in use and no alternative found",
+                    configured_port
+                )));
+            }
+        }
+    } else {
+        configured_port
+    };
+
+    let graphql_endpoint = format!("http://localhost:{}/graphql", port);
+    let graphql_playground = format!("http://localhost:{}/playground", port);
+
+    // Check if there are table name conflicts - if so, skip node alias plugin
+    let skip_node_alias_plugin = has_table_name_conflicts(indexer);
+    if skip_node_alias_plugin {
+        info!(
+            "Detected table name conflicts across contracts - disabling node alias plugin to avoid GraphQL type conflicts"
+        );
+    }
 
     let (tx, rx) = oneshot::channel();
     let tx_arc = Arc::new(Mutex::new(Some(tx)));
@@ -115,10 +183,8 @@ pub async fn start_graphql_server(
         Arc::new(port),
         settings.filter_only_on_indexed_columns,
         settings.disable_advanced_filters,
+        skip_node_alias_plugin,
     );
-
-    // Do not need now with the main shutdown keeping around in-case
-    // setup_ctrlc_handler(Arc::new(Mutex::new(None::<Child>)));
 
     // Wait for the initial server startup
     let pid = rx.await.map_err(|e| {
@@ -126,6 +192,7 @@ pub async fn start_graphql_server(
             "Failed to receive initial PID: {e}"
         ))
     })?;
+    GRAPHQL_PID.store(pid, Ordering::SeqCst);
 
     perform_health_check(&graphql_endpoint, &graphql_playground).await?;
 
@@ -133,7 +200,23 @@ pub async fn start_graphql_server(
 }
 
 static MANUAL_STOP: AtomicBool = AtomicBool::new(false);
+static GRAPHQL_PID: AtomicU32 = AtomicU32::new(0);
 
+/// Signal the GraphQL server to stop its restart loop and kill the child process.
+pub fn stop_graphql_server() {
+    MANUAL_STOP.store(true, Ordering::SeqCst);
+
+    let pid = GRAPHQL_PID.load(Ordering::SeqCst);
+    if pid != 0 {
+        #[cfg(unix)]
+        let _ = Command::new("kill").args(["-TERM", &pid.to_string()]).output();
+
+        #[cfg(windows)]
+        let _ = Command::new("taskkill").args(["/PID", &pid.to_string(), "/T", "/F"]).output();
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn spawn_start_server(
     tx_arc: Arc<Mutex<Option<Sender<u32>>>>,
     rindexer_graphql_exe: PathBuf,
@@ -142,6 +225,7 @@ fn spawn_start_server(
     port: Arc<u16>,
     filter_only_on_indexed_columns: bool,
     disable_advanced_filters: bool,
+    skip_node_alias_plugin: bool,
 ) {
     tokio::spawn(async move {
         loop {
@@ -156,13 +240,13 @@ fn spawn_start_server(
                 &port,
                 filter_only_on_indexed_columns,
                 disable_advanced_filters,
+                skip_node_alias_plugin,
             )
             .await
             {
                 Ok(child) => {
                     let pid = child.id();
                     let child_arc = Arc::new(Mutex::new(Some(child)));
-                    let child_inner_for_thread = Arc::clone(&child_arc);
 
                     if let Some(tx) = tx_arc.lock().expect("Failed to lock tx arc").take() {
                         if let Err(e) = tx.send(pid) {
@@ -171,43 +255,31 @@ fn spawn_start_server(
                         }
                     }
 
-                    let port_inner = Arc::clone(&port);
-
-                    tokio::spawn(async move {
-                        set_thread_no_logging();
-                        match child_inner_for_thread.lock() {
+                    // Use spawn_blocking for the blocking wait() call to avoid
+                    // starving other async tasks on the tokio runtime
+                    let child_for_wait = Arc::clone(&child_arc);
+                    let wait_result =
+                        tokio::task::spawn_blocking(move || match child_for_wait.lock() {
                             Ok(mut guard) => match guard.as_mut() {
-                                Some(ref mut child) => match child.wait() {
-                                    Ok(status) => {
-                                        if status.success() {
-                                            info!(
-                                                "🦀GraphQL API ready at http://0.0.0.0:{}/",
-                                                port_inner
-                                            );
-                                        } else {
-                                            error!("GraphQL: Could not start up API: Child process exited with errors");
-                                        }
-                                    }
-                                    Err(e) => {
-                                        error!("GraphQL: Failed to wait on child process: {}", e);
-                                    }
-                                },
-                                None => error!("GraphQL: Child process is None"),
+                                Some(ref mut child) => child.wait(),
+                                None => Err(std::io::Error::other("Child process is None")),
                             },
                             Err(e) => {
-                                error!("GraphQL: Failed to lock child process for waiting: {}", e);
+                                Err(std::io::Error::other(format!("Failed to lock child: {}", e)))
                             }
-                        }
-                    });
+                        })
+                        .await;
 
-                    if let Err(e) = child_arc
-                        .lock()
-                        .expect("Failed to lock child arc")
-                        .as_mut()
-                        .expect("Failed to get child")
-                        .wait()
-                    {
-                        error!("Failed to wait on child process: {}", e);
+                    match wait_result {
+                        Ok(Ok(_status)) => {
+                            // Process exited, will restart in loop if not manual stop
+                        }
+                        Ok(Err(e)) => {
+                            error!("Failed to wait on child process: {}", e);
+                        }
+                        Err(e) => {
+                            error!("spawn_blocking join error: {}", e);
+                        }
                     }
 
                     if !MANUAL_STOP.load(Ordering::SeqCst) {
@@ -232,6 +304,7 @@ async fn start_server(
     port: &u16,
     filter_only_on_indexed_columns: bool,
     disable_advanced_filters: bool,
+    skip_node_alias_plugin: bool,
 ) -> Result<Child, String> {
     Command::new(rindexer_graphql_exe)
         .arg(connection_string)
@@ -243,8 +316,9 @@ async fn start_server(
         .arg("10000")
         .arg(filter_only_on_indexed_columns.to_string())
         .arg(disable_advanced_filters.to_string())
+        .arg(skip_node_alias_plugin.to_string())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::inherit()) // Show errors from GraphQL server
         .spawn()
         .map_err(|e| e.to_string())
 }
@@ -269,30 +343,37 @@ async fn perform_health_check(
                                 "🦀 GraphQL API ready at {} Playground - {} 🦀",
                                 graphql_endpoint, graphql_playground
                             );
-                            break;
+                            return Ok(());
+                        } else {
+                            error!(
+                                "GraphQL health check returned errors: {:?}",
+                                response_json.get("errors")
+                            );
                         }
                     }
-                    Err(_) => {
-                        // try again
-                        info!("🦀 GraphQL API not healthy yet...");
-                        continue;
+                    Err(e) => {
+                        error!("GraphQL health check JSON parse error: {}", e);
                     }
                 }
             }
-            _ => {}
+            Ok(response) => {
+                error!("GraphQL health check failed with status: {}", response.status());
+            }
+            Err(_) => {
+                // Connection error - server might not be ready yet
+                if health_check_attempts == 0 {
+                    info!("Waiting for GraphQL server to start...");
+                }
+            }
         }
         health_check_attempts += 1;
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
 
-    if health_check_attempts >= 40 {
-        error!("GraphQL API did not become ready in time");
-        return Err(StartGraphqlServerError::GraphQLServerStartupError(
-            "GraphQL API did not become ready in time".to_string(),
-        ));
-    }
-
-    Ok(())
+    error!("GraphQL API did not become ready in time after {} attempts", health_check_attempts);
+    Err(StartGraphqlServerError::GraphQLServerStartupError(
+        "GraphQL API did not become ready in time".to_string(),
+    ))
 }
 
 // Do not need now with the main shutdown keeping around in-case

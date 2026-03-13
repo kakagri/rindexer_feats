@@ -12,7 +12,10 @@ use tokio::{
 use tracing::{debug, error};
 
 use crate::database::clickhouse::client::ClickhouseClient;
-use crate::database::postgres::generate::generate_internal_event_table_name_no_shorten;
+use crate::database::postgres::generate::{
+    generate_internal_cron_table_name, generate_internal_cron_table_name_no_shorten,
+    generate_internal_event_table_name_no_shorten,
+};
 use crate::{
     database::{
         generate::generate_indexer_contract_schema_name,
@@ -21,6 +24,7 @@ use crate::{
     event::config::{EventProcessingConfig, TraceProcessingConfig},
     helpers::get_full_path,
     manifest::{storage::CsvDetails, stream::StreamsConfig},
+    metrics::indexing as metrics,
     EthereumSqlTypeWrapper, PostgresClient,
 };
 
@@ -87,69 +91,10 @@ pub struct SyncConfig<'a> {
 }
 
 pub async fn get_last_synced_block_number(config: SyncConfig<'_>) -> Option<U64> {
-    // Check CSV file for last seen block as no database enabled
-    if config.postgres.is_none() && config.contract_csv_enabled {
-        if let Some(csv_details) = config.csv_details {
-            return if let Ok(result) = get_last_synced_block_number_file(
-                &get_full_path(config.project_path, &csv_details.path).unwrap_or_else(|_| {
-                    panic!("failed to get full path {}", config.project_path.display())
-                }),
-                config.contract_name,
-                config.network,
-                config.event_name,
-            )
-            .await
-            {
-                if let Some(value) = result {
-                    if value.is_zero() {
-                        return None;
-                    }
-                }
+    // 1. Database storage takes priority (matches write-side priority in
+    //    update_progress_and_last_synced_task which uses postgres > clickhouse > csv > stream)
 
-                result
-            } else {
-                error!("Error fetching last synced block from CSV");
-                None
-            };
-        }
-    }
-
-    // Then check streams if no csv or database to find out last synced block
-    if config.postgres.is_none() && !config.contract_csv_enabled && config.stream_details.is_some()
-    {
-        let stream_details = config.stream_details.as_ref().unwrap();
-
-        // create the path if it does not exist
-        stream_details
-            .create_full_streams_last_synced_block_path(config.project_path, config.contract_name)
-            .await;
-
-        return if let Ok(result) = get_last_synced_block_number_file(
-            &config
-                .project_path
-                .join(stream_details.get_streams_last_synced_block_path())
-                .canonicalize()
-                .expect("Failed to canonicalize path"),
-            config.contract_name,
-            config.network,
-            config.event_name,
-        )
-        .await
-        {
-            if let Some(value) = result {
-                if value.is_zero() {
-                    return None;
-                }
-            }
-
-            result
-        } else {
-            error!("Error fetching last synced block from stream");
-            None
-        };
-    }
-
-    // Query database for last synced block
+    // Query Postgres for last synced block
     if let Some(postgres) = config.postgres {
         let schema =
             generate_indexer_contract_schema_name(config.indexer_name, config.contract_name);
@@ -176,7 +121,7 @@ pub async fn get_last_synced_block_number(config: SyncConfig<'_>) -> Option<U64>
         };
     }
 
-    // Query database for last synced block
+    // Query ClickHouse for last synced block
     if let Some(clickhouse) = config.clickhouse {
         #[derive(Row, Deserialize)]
         struct LastBlock {
@@ -211,6 +156,69 @@ pub async fn get_last_synced_block_number(config: SyncConfig<'_>) -> Option<U64>
                 error!("Error fetching last synced block: {:?}", e);
                 None
             }
+        };
+    }
+
+    // 2. File-based fallbacks (only when no database storage is configured)
+
+    // Check CSV file for last seen block
+    if config.contract_csv_enabled {
+        if let Some(csv_details) = config.csv_details {
+            return if let Ok(result) = get_last_synced_block_number_file(
+                &get_full_path(config.project_path, &csv_details.path).unwrap_or_else(|_| {
+                    panic!("failed to get full path {}", config.project_path.display())
+                }),
+                config.contract_name,
+                config.network,
+                config.event_name,
+            )
+            .await
+            {
+                if let Some(value) = result {
+                    if value.is_zero() {
+                        return None;
+                    }
+                }
+
+                result
+            } else {
+                error!("Error fetching last synced block from CSV");
+                None
+            };
+        }
+    }
+
+    // Check stream files for last seen block
+    if config.stream_details.is_some() {
+        let stream_details = config.stream_details.as_ref().unwrap();
+
+        // create the path if it does not exist
+        stream_details
+            .create_full_streams_last_synced_block_path(config.project_path, config.contract_name)
+            .await;
+
+        return if let Ok(result) = get_last_synced_block_number_file(
+            &config
+                .project_path
+                .join(stream_details.get_streams_last_synced_block_path())
+                .canonicalize()
+                .expect("Failed to canonicalize path"),
+            config.contract_name,
+            config.network,
+            config.event_name,
+        )
+        .await
+        {
+            if let Some(value) = result {
+                if value.is_zero() {
+                    return None;
+                }
+            }
+
+            result
+        } else {
+            error!("Error fetching last synced block from stream");
+            None
         };
     }
 
@@ -291,6 +299,18 @@ pub async fn update_progress_and_last_synced_task(
         .flatten()
         .map(|b| b.header.number)
         .unwrap_or(0);
+
+    // Record block progress metrics
+    let network = &config.network_contract().network;
+    let contract = &config.contract_name();
+    let event = &config.event_name();
+    let to_block_u64 = to_block.to::<u64>();
+
+    metrics::set_last_synced_block(network, contract, event, to_block_u64);
+    if latest > 0 {
+        metrics::set_latest_chain_block(network, latest);
+        metrics::set_blocks_behind(network, contract, event, to_block_u64, latest);
+    }
 
     if let Some(postgres) = &config.postgres() {
         let schema =
@@ -445,4 +465,144 @@ pub async fn evm_trace_update_progress_and_last_synced_task(
     }
 
     on_complete();
+}
+
+// ============================================================================
+// Cron Sync State Functions
+// ============================================================================
+
+/// Configuration for cron sync state operations.
+pub struct CronSyncConfig<'a> {
+    pub postgres: &'a Option<Arc<PostgresClient>>,
+    pub clickhouse: &'a Option<Arc<ClickhouseClient>>,
+    pub indexer_name: &'a str,
+    pub contract_name: &'a str,
+    pub table_name: &'a str,
+    pub cron_index: usize,
+    pub network: &'a str,
+}
+
+/// Get the last synced block for a cron entry from the database.
+///
+/// Returns `None` if the block is 0 (never synced) or on error.
+pub async fn get_last_synced_cron_block(config: CronSyncConfig<'_>) -> Option<U64> {
+    // Query PostgreSQL for last synced block
+    if let Some(postgres) = config.postgres {
+        let schema =
+            generate_indexer_contract_schema_name(config.indexer_name, config.contract_name);
+        let table_name =
+            generate_internal_cron_table_name(&schema, config.table_name, config.cron_index);
+        let query = format!(
+            "SELECT last_synced_block FROM rindexer_internal.{table_name} WHERE network = $1"
+        );
+
+        return match postgres.query_one(&query, &[&config.network]).await {
+            Ok(row) => {
+                let result: Decimal = row.get("last_synced_block");
+                let parsed =
+                    U64::from_str(&result.to_string()).expect("Failed to parse last_synced_block");
+                if parsed.is_zero() {
+                    None
+                } else {
+                    Some(parsed)
+                }
+            }
+            Err(e) => {
+                error!("Error fetching cron last synced block: {:?}", e);
+                None
+            }
+        };
+    }
+
+    // Query ClickHouse for last synced block
+    if let Some(clickhouse) = config.clickhouse {
+        #[derive(Row, Deserialize)]
+        struct LastBlock {
+            last_synced_block: u64,
+        }
+
+        let schema =
+            generate_indexer_contract_schema_name(config.indexer_name, config.contract_name);
+        let table_name = generate_internal_cron_table_name_no_shorten(
+            &schema,
+            config.table_name,
+            config.cron_index,
+        );
+        let query = format!(
+            "SELECT last_synced_block FROM rindexer_internal.{table_name} FINAL WHERE network = '{}'",
+            config.network
+        );
+
+        let row = clickhouse.query_one::<LastBlock>(&query).await;
+
+        return match row {
+            Ok(row) => {
+                let result = row.last_synced_block;
+                if result == 0 {
+                    None
+                } else {
+                    Some(U64::from(result))
+                }
+            }
+            Err(e) => {
+                error!("Error fetching cron last synced block from clickhouse: {:?}", e);
+                None
+            }
+        };
+    }
+
+    None
+}
+
+/// Update the last synced block for a cron entry in the database.
+#[allow(clippy::too_many_arguments)]
+pub async fn update_last_synced_cron_block(
+    postgres: &Option<Arc<PostgresClient>>,
+    clickhouse: &Option<Arc<ClickhouseClient>>,
+    indexer_name: &str,
+    contract_name: &str,
+    table_name: &str,
+    cron_index: usize,
+    network: &str,
+    to_block: U64,
+) {
+    debug!(
+        "update_last_synced_cron_block called: indexer={}, contract={}, table={}, cron_index={}, network={}, to_block={}",
+        indexer_name, contract_name, table_name, cron_index, network, to_block
+    );
+
+    if let Some(postgres) = postgres {
+        let schema = generate_indexer_contract_schema_name(indexer_name, contract_name);
+        let internal_table_name =
+            generate_internal_cron_table_name(&schema, table_name, cron_index);
+        let query = format!(
+            "UPDATE rindexer_internal.{internal_table_name} SET last_synced_block = {to_block} WHERE network = '{network}' AND {to_block} > last_synced_block"
+        );
+
+        debug!("Cron sync update query: {}", query);
+
+        let result = postgres.batch_execute(&query).await;
+
+        match &result {
+            Ok(_) => debug!("Cron sync update successful for table {}", internal_table_name),
+            Err(e) => error!("Error updating cron last synced block in postgres: {:?}", e),
+        }
+    } else {
+        debug!("update_last_synced_cron_block: postgres is None");
+    }
+
+    if let Some(clickhouse) = clickhouse {
+        let schema = generate_indexer_contract_schema_name(indexer_name, contract_name);
+        let internal_table_name =
+            generate_internal_cron_table_name_no_shorten(&schema, table_name, cron_index);
+        let query = format!(
+            "INSERT INTO rindexer_internal.{internal_table_name} (network, last_synced_block) VALUES ('{network}', {to_block})"
+        );
+
+        let result = clickhouse.execute(&query).await;
+
+        if let Err(e) = result {
+            error!("Error updating cron last synced block in clickhouse: {:?}", e);
+        }
+    }
 }

@@ -116,21 +116,32 @@ impl ABIInput {
         inputs
             .iter()
             .flat_map(|input| {
-                if let Some(components) = &input.components {
-                    let new_path = path.clone().map_or_else(
-                        || vec![AbiNamePropertiesPath::new(&input.name, &input.type_)],
-                        |mut p| {
-                            p.push(AbiNamePropertiesPath::new(&input.name, &input.type_));
-                            p
-                        },
-                    );
+                // For tuple arrays (both dynamic tuple[] and fixed-size tuple[N]),
+                // don't flatten - store as JSONB since array length varies
+                let is_tuple_array = input.type_.starts_with("tuple[");
 
-                    ABIInput::generate_abi_name_properties(
-                        components,
-                        properties_type,
-                        Some(new_path),
-                    )
-                } else {
+                // Regular tuples with components get flattened into columns via recursion
+                // Tuple arrays skip this and are treated as leaf nodes for JSONB storage
+                if let Some(components) = &input.components {
+                    if !is_tuple_array {
+                        let new_path = path.clone().map_or_else(
+                            || vec![AbiNamePropertiesPath::new(&input.name, &input.type_)],
+                            |mut p| {
+                                p.push(AbiNamePropertiesPath::new(&input.name, &input.type_));
+                                p
+                            },
+                        );
+
+                        return ABIInput::generate_abi_name_properties(
+                            components,
+                            properties_type,
+                            Some(new_path),
+                        );
+                    }
+                }
+
+                // Leaf node (primitive type, or tuple[] which is stored as JSONB)
+                {
                     let prefix = path.as_ref().map(|p| {
                         p.iter()
                             .map(|pp| camel_to_snake(&pp.abi_name))
@@ -266,20 +277,30 @@ impl ABIItem {
         let abi_str = contract.parse_abi(project_path)?;
         let abi_items: Vec<ABIItem> = serde_json::from_str(&abi_str)?;
 
-        let filtered_abi_items = match &contract.include_events {
-            Some(events) => abi_items
-                .into_iter()
-                .filter(|item| {
-                    item.type_ != "event"
-                        || events
-                            .iter()
-                            .map(|a| a.name.clone())
-                            .collect::<Vec<_>>()
-                            .contains(&item.name)
-                })
-                .collect(),
-            None => abi_items,
-        };
+        // Get events from include_events
+        let include_event_names: Vec<String> = contract
+            .include_events
+            .as_ref()
+            .map(|events| events.iter().map(|a| a.name.clone()).collect())
+            .unwrap_or_default();
+
+        // Get events from tables
+        let table_event_names = contract.get_table_event_names();
+
+        // If both are empty, return all events (backward compatible behavior)
+        if include_event_names.is_empty() && table_event_names.is_empty() {
+            return Ok(abi_items);
+        }
+
+        // Combine both sets of event names
+        let all_needed_events: std::collections::HashSet<String> =
+            include_event_names.into_iter().chain(table_event_names).collect();
+
+        // Filter to only include needed events (keep all non-event items)
+        let filtered_abi_items = abi_items
+            .into_iter()
+            .filter(|item| item.type_ != "event" || all_needed_events.contains(&item.name))
+            .collect();
 
         Ok(filtered_abi_items)
     }

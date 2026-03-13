@@ -1,0 +1,4687 @@
+//! Tables support for no-code aggregation tables.
+//!
+//! This module provides runtime processing of table operations
+//! defined in the rindexer.yaml configuration, allowing upsert, update,
+//! and delete operations on custom tables without writing Rust code.
+//!
+//! ## Auto-Injected Columns
+//!
+//! Every custom table automatically gets these metadata columns:
+//!
+//! - `rindexer_sequence_id` (NUMERIC) - Unique ID for deterministic ordering
+//!   computed as: `block_number * 100_000_000 + tx_index * 100_000 + log_index`
+//! - `rindexer_block_number` (BIGINT NOT NULL) - The block number of the event
+//! - `rindexer_block_timestamp` (TIMESTAMPTZ NOT NULL) - The block timestamp of the event
+//!   **Only added when `timestamp: true` is set on the table.**
+//!   When enabled but metadata lacks the timestamp, it's batch-fetched from RPC and cached.
+//! - `rindexer_tx_hash` (CHAR(66) NOT NULL) - The transaction hash of the event
+//! - `rindexer_block_hash` (CHAR(66) NOT NULL) - The block hash of the event
+//! - `rindexer_contract_address` (CHAR(42) NOT NULL) - The contract address that emitted the event
+//!
+//! These columns are automatically set by rindexer and do NOT need to be defined
+//! in your YAML configuration.
+//!
+//! ## Supported Value References
+//!
+//! In the YAML config, you can reference values using the `$` prefix:
+//!
+//! - **Explicit NULL**: `$null` - Set a column to SQL NULL (only works if column is nullable)
+//! - **Conditional values**: `$if(condition, trueValue, falseValue)` - Conditionally set value
+//!   - Example: `$if($amount > 0, $amount, $null)` - Use amount if positive, else null
+//!   - Supports all condition operators: `==`, `!=`, `>`, `<`, `>=`, `<=`, `&&`, `||`
+//! - **Event fields**: `$from`, `$to`, `$value`, etc. (any field from the event)
+//! - **Nested tuple fields**: `$data.amount`, `$info.token.address` (for events with tuples/structs)
+//! - **Array indexing**: `$ids[0]`, `$data.tokens[1]` (access specific array elements)
+//! - **Post-array field access**: `$transfers[0].amount`, `$orders[1].maker` (array element then named field)
+//! - **String templates**: `"Pool: $token0/$token1"`, `"$from-$to"` (embed fields in strings)
+//! - **View calls**: `$call($rindexer_contract_address, "balanceOf(address)", $holder)` (on-chain data)
+//!   - **Position-based access**: `$call($addr, "getReserves()")[0]` - access tuple/array elements by index
+//!   - **Named field access**: `$call($addr, "getReserves() returns (uint112 reserve0, uint112 reserve1)").reserve0`
+//!   - **Chained access**: `$call($addr, "getData() returns ((uint256 x, uint256 y) point)").point.x`
+//! - **Constants**: `$constant(name)` - Reference user-defined constants from the YAML config
+//!   - **Simple constants**: Same value for all networks
+//!   - **Network-scoped constants**: Different value per network (auto-resolved based on current network)
+//! - **Transaction metadata** (all prefixed with `rindexer_` to avoid conflicts with event fields):
+//!   - `$rindexer_block_number` - The block number
+//!   - `$rindexer_block_timestamp` - The block timestamp (as TIMESTAMPTZ)
+//!   - `$rindexer_tx_hash` - The transaction hash (as hex string)
+//!   - `$rindexer_block_hash` - The block hash (as hex string)
+//!   - `$rindexer_contract_address` - The contract address that emitted the event
+//!   - `$rindexer_log_index` - The log index within the transaction
+//!   - `$rindexer_tx_index` - The transaction index within the block
+//!
+//! ## Filter Expressions
+//!
+//! The `filter` field supports powerful expressions for filtering events:
+//!
+//! - **Comparison operators**: `==`, `!=`, `>`, `<`, `>=`, `<=`
+//! - **Logical operators**: `&&` (and), `||` (or)
+//! - **Nested field access**: `data.amount`, `info.token.address`
+//!
+//! Examples:
+//! ```yaml
+//! # Simple comparison
+//! filter: "to != 0x0000000000000000000000000000000000000000"
+//!
+//! # Multiple conditions with AND
+//! filter: "value > 0 && from != 0x0000000000000000000000000000000000000000"
+//!
+//! # Complex expression with OR
+//! filter: "value >= 1000000 || (from == 0x1234... && to != 0x5678...)"
+//!
+//! # Nested field access
+//! filter: "data.amount > 0 && data.recipient != 0x0000..."
+//! ```
+//!
+//! ## Global Tables
+//!
+//! For aggregate/counter tables that need only one row per network, use `global: true`.
+//! Global tables don't require a `where` clause - the primary key is just `network`.
+//!
+//! ## Array Iteration
+//!
+//! For events with parallel arrays (like ERC1155 `TransferBatch`), use `iterate` to process
+//! each array element as a separate operation:
+//!
+//! ```yaml
+//! events:
+//!   - event: TransferBatch
+//!     iterate:
+//!       - "$ids as token_id"       # First array to iterate
+//!       - "$values as amount"      # Second array (must be same length)
+//!     operations:
+//!       - type: upsert
+//!         where:
+//!           holder: $to
+//!           token_id: $token_id    # Use the aliased value
+//!         set:
+//!           - column: balance
+//!             action: add
+//!             value: $amount       # Use the aliased value
+//! ```
+//!
+//! This creates one operation per array element, with `$token_id` and `$amount` bound to
+//! the corresponding elements at each index.
+//!
+//! ## Example YAML
+//!
+//! ```yaml
+//! tables:
+//!   # Regular table with per-address rows
+//!   - name: token_balances
+//!     columns:
+//!       - name: holder         # Will be primary key (used in 'where')
+//!       - name: balance
+//!         default: "0"
+//!     events:
+//!       - event: Transfer
+//!         operations:
+//!           - type: upsert
+//!             where:
+//!               holder: $to    # This makes 'holder' the primary key
+//!             filter: "to != 0x0000000000000000000000000000000000000000"
+//!             set:
+//!               - column: balance
+//!                 action: add
+//!                 value: $value
+//!
+//!   # Global table for aggregate counters (one row per network)
+//!   - name: token_supply
+//!     global: true             # No 'where' clause needed
+//!     columns:
+//!       - name: total_supply
+//!         default: "0"
+//!     events:
+//!       - event: Transfer
+//!         operations:
+//!           - type: upsert
+//!             filter: "from == 0x0000..."  # Mint events
+//!             set:
+//!               - column: total_supply
+//!                 action: add
+//!                 value: $value
+//! ```
+
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use alloy::dyn_abi::{DynSolType, DynSolValue};
+use alloy::primitives::{Address, Bytes, B256, U256, U64};
+use chrono::{DateTime, Utc};
+use once_cell::sync::Lazy;
+use serde_json::{json, Value};
+use tokio::sync::RwLock;
+use tracing::{debug, info, warn};
+
+use crate::adaptive_concurrency::ADAPTIVE_CONCURRENCY;
+use crate::database::batch_operations::{
+    BatchOperationAction, BatchOperationColumnBehavior, BatchOperationSqlType, BatchOperationType,
+    DynamicColumnDefinition,
+};
+use crate::database::clickhouse::batch_operations::execute_dynamic_batch_operation as execute_clickhouse_dynamic_batch_operation;
+use crate::database::clickhouse::client::ClickhouseClient;
+use crate::database::generate::generate_indexer_contract_schema_name;
+use crate::database::generate::generate_table_full_name;
+use crate::database::postgres::batch_operations::execute_dynamic_batch_operation;
+use crate::database::postgres::client::PostgresClient;
+use crate::database::postgres::generate::generate_internal_event_table_name;
+use crate::database::sql_type_wrapper::EthereumSqlTypeWrapper;
+use crate::event::{
+    evaluate_arithmetic, filter_by_expression, parse_filter_expression, ComputedValue,
+};
+use crate::manifest::contract::{
+    compute_sequence_id, injected_columns, ColumnType, IterateBinding, OperationType, SetAction,
+    Table, TableOperation,
+};
+use crate::manifest::core::Constants;
+use crate::provider::JsonRpcCachedProvider;
+use crate::system_state::is_running;
+use crate::types::core::LogParam;
+
+/// Configuration for tracking and checkpointing progress during table operations.
+#[derive(Clone)]
+pub struct ProgressCheckpointConfig {
+    pub indexer_name: String,
+    pub contract_name: String,
+    pub event_name: String,
+    pub postgres: Option<Arc<PostgresClient>>,
+}
+
+impl ProgressCheckpointConfig {
+    pub fn new(
+        indexer_name: String,
+        contract_name: String,
+        event_name: String,
+        postgres: Option<Arc<PostgresClient>>,
+    ) -> Self {
+        Self { indexer_name, contract_name, event_name, postgres }
+    }
+
+    /// Save the last synced block for a specific network.
+    /// Only updates if the new block is higher than the current value.
+    pub async fn checkpoint(&self, network: &str, block_number: u64) {
+        if let Some(postgres) = &self.postgres {
+            let schema =
+                generate_indexer_contract_schema_name(&self.indexer_name, &self.contract_name);
+            let table_name = generate_internal_event_table_name(&schema, &self.event_name);
+            let query = format!(
+                "UPDATE rindexer_internal.{table_name} SET last_synced_block = {block_number} WHERE network = '{network}' AND {block_number} > last_synced_block"
+            );
+            if let Err(e) = postgres.batch_execute(&query).await {
+                tracing::warn!("Failed to checkpoint progress at block {}: {:?}", block_number, e);
+            } else {
+                tracing::info!(
+                    "Checkpointed {}::{} at block {}",
+                    self.event_name,
+                    network,
+                    block_number
+                );
+            }
+        }
+    }
+}
+
+/// Cache key type for view calls: (network, contract_address, calldata, block_number).
+type ViewCallCacheKey = (String, Address, Bytes, u64);
+
+/// Maximum entries in VIEW_CALL_CACHE before eviction.
+/// Old block entries are removed since they won't be needed again.
+const VIEW_CALL_CACHE_MAX_SIZE: usize = 10_000;
+
+/// Global cache for view call results. Key is (network, contract, calldata, block_number).
+/// Uses block_number for determinism - same call at same block always returns same result.
+/// Evicts oldest block entries when exceeding VIEW_CALL_CACHE_MAX_SIZE.
+static VIEW_CALL_CACHE: Lazy<RwLock<HashMap<ViewCallCacheKey, DynSolValue>>> =
+    Lazy::new(|| RwLock::new(HashMap::new()));
+
+/// Cache key type for static view calls: (network, contract_address, calldata).
+/// No block_number - static calls are for immutable data like token symbol/decimals.
+type StaticCallCacheKey = (String, Address, Bytes);
+
+/// Global cache for static view call results. Key is (network, contract, calldata).
+/// For immutable onchain data (symbol, decimals, name) - cached forever, called at latest block.
+static STATIC_CALL_CACHE: Lazy<RwLock<HashMap<StaticCallCacheKey, DynSolValue>>> =
+    Lazy::new(|| RwLock::new(HashMap::new()));
+
+/// Cache key type for block timestamps: (network, block_number).
+type BlockTimestampCacheKey = (String, u64);
+
+/// Maximum entries in BLOCK_TIMESTAMP_CACHE before eviction.
+const BLOCK_TIMESTAMP_CACHE_MAX_SIZE: usize = 10_000;
+
+/// Global cache for block timestamps. Key is (network, block_number).
+/// Block timestamps are immutable. Evicts oldest block entries when full.
+static BLOCK_TIMESTAMP_CACHE: Lazy<RwLock<HashMap<BlockTimestampCacheKey, u64>>> =
+    Lazy::new(|| RwLock::new(HashMap::new()));
+
+/// Evicts oldest entries from VIEW_CALL_CACHE when it exceeds max size.
+/// Removes entries with the lowest block numbers since they won't be needed again.
+async fn evict_old_view_call_cache_entries() {
+    let mut cache = VIEW_CALL_CACHE.write().await;
+    if cache.len() <= VIEW_CALL_CACHE_MAX_SIZE {
+        return;
+    }
+
+    // Find the median block number and remove everything below it
+    let mut block_numbers: Vec<u64> = cache.keys().map(|(_, _, _, block)| *block).collect();
+    block_numbers.sort_unstable();
+
+    if let Some(&cutoff_block) = block_numbers.get(block_numbers.len() / 2) {
+        let before_len = cache.len();
+        cache.retain(|(_, _, _, block), _| *block > cutoff_block);
+        let removed = before_len - cache.len();
+        if removed > 0 {
+            info!(
+                "VIEW_CALL_CACHE eviction: removed {} entries (blocks <= {}), {} remaining",
+                removed,
+                cutoff_block,
+                cache.len()
+            );
+        }
+    }
+}
+
+/// Evicts oldest entries from BLOCK_TIMESTAMP_CACHE when it exceeds max size.
+async fn evict_old_block_timestamp_cache_entries() {
+    let mut cache = BLOCK_TIMESTAMP_CACHE.write().await;
+    if cache.len() <= BLOCK_TIMESTAMP_CACHE_MAX_SIZE {
+        return;
+    }
+
+    let mut block_numbers: Vec<u64> = cache.keys().map(|(_, block)| *block).collect();
+    block_numbers.sort_unstable();
+
+    if let Some(&cutoff_block) = block_numbers.get(block_numbers.len() / 2) {
+        let before_len = cache.len();
+        cache.retain(|(_, block), _| *block > cutoff_block);
+        let removed = before_len - cache.len();
+        if removed > 0 {
+            info!(
+                "BLOCK_TIMESTAMP_CACHE eviction: removed {} entries (blocks <= {}), {} remaining",
+                removed,
+                cutoff_block,
+                cache.len()
+            );
+        }
+    }
+}
+
+/// Progress tracking key: (event_name, network)
+type ProgressKey = (String, String);
+
+/// Global counter for events fetched per (event_name, network).
+/// Incremented when eth_getLogs returns events.
+static EVENTS_FETCHED: Lazy<RwLock<HashMap<ProgressKey, std::sync::atomic::AtomicUsize>>> =
+    Lazy::new(|| RwLock::new(HashMap::new()));
+
+/// Global counter for events processed per (event_name, network).
+/// Incremented when view calls are resolved and event is ready for DB insert.
+static EVENTS_PROCESSED: Lazy<RwLock<HashMap<ProgressKey, std::sync::atomic::AtomicUsize>>> =
+    Lazy::new(|| RwLock::new(HashMap::new()));
+
+/// Resets progress counters for a fresh indexing run.
+pub async fn reset_progress_counters() {
+    EVENTS_FETCHED.write().await.clear();
+    EVENTS_PROCESSED.write().await.clear();
+}
+
+/// Increments the fetched events counter for a (event_name, network) pair.
+pub async fn increment_events_fetched(event_name: &str, network: &str, count: usize) {
+    let key = (event_name.to_string(), network.to_string());
+    let mut counters = EVENTS_FETCHED.write().await;
+    counters
+        .entry(key)
+        .or_insert_with(|| std::sync::atomic::AtomicUsize::new(0))
+        .fetch_add(count, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Gets the current fetched count for a (event_name, network) pair.
+async fn get_events_fetched(event_name: &str, network: &str) -> usize {
+    let key = (event_name.to_string(), network.to_string());
+    let counters = EVENTS_FETCHED.read().await;
+    counters.get(&key).map(|c| c.load(std::sync::atomic::Ordering::Relaxed)).unwrap_or(0)
+}
+
+/// Increments the processed events counter for a (event_name, network) pair.
+async fn increment_events_processed(event_name: &str, network: &str, count: usize) {
+    let key = (event_name.to_string(), network.to_string());
+    let mut counters = EVENTS_PROCESSED.write().await;
+    counters
+        .entry(key)
+        .or_insert_with(|| std::sync::atomic::AtomicUsize::new(0))
+        .fetch_add(count, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Gets the current processed count for a (event_name, network) pair.
+async fn get_events_processed(event_name: &str, network: &str) -> usize {
+    let key = (event_name.to_string(), network.to_string());
+    let counters = EVENTS_PROCESSED.read().await;
+    counters.get(&key).map(|c| c.load(std::sync::atomic::Ordering::Relaxed)).unwrap_or(0)
+}
+
+/// Default limit for concurrent individual eth_call requests.
+const DEFAULT_MAX_CONCURRENT_VIEW_CALLS: usize = 10;
+
+/// Semaphore to limit concurrent individual view calls.
+static VIEW_CALL_SEMAPHORE: Lazy<RwLock<std::sync::Arc<tokio::sync::Semaphore>>> =
+    Lazy::new(|| {
+        RwLock::new(std::sync::Arc::new(tokio::sync::Semaphore::new(
+            DEFAULT_MAX_CONCURRENT_VIEW_CALLS,
+        )))
+    });
+
+/// Configure the maximum number of concurrent view calls.
+/// Should be called once at startup before any view calls are made.
+/// If not called, defaults to 10 concurrent calls.
+pub async fn configure_view_call_limit(limit: usize) {
+    let mut semaphore = VIEW_CALL_SEMAPHORE.write().await;
+    *semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(limit));
+    info!("View call concurrency limit set to {}", limit);
+}
+
+/// Default Multicall3 contract address - same on almost all EVM chains
+/// See: https://www.multicall3.com/deployments
+const DEFAULT_MULTICALL3_ADDRESS: &str = "0xcA11bde05977b3631167028862bE2a173976CA11";
+
+// Note: Batch size is now adaptive (5-100) via ADAPTIVE_CONCURRENCY.current_batch_size()
+// It starts at 50 and scales down to 5 on rate limits, back up to 100 on consecutive successes.
+
+/// Networks where Multicall3 is known to not be available.
+/// This is populated at runtime when a Multicall3 call fails.
+static NETWORKS_WITHOUT_MULTICALL3: Lazy<RwLock<std::collections::HashSet<String>>> =
+    Lazy::new(|| RwLock::new(std::collections::HashSet::new()));
+
+/// Represents a pending view call to be batched
+#[derive(Debug, Clone)]
+struct PendingViewCall {
+    target: Address,
+    calldata: Bytes,
+    block_number: u64,
+    network: String,
+}
+
+/// Gets the Multicall3 address for a network.
+/// Uses custom address if provided, otherwise returns default.
+fn get_multicall3_address(network_config: Option<&str>) -> Address {
+    match network_config {
+        Some(addr) if !addr.is_empty() => {
+            addr.parse().unwrap_or_else(|_| DEFAULT_MULTICALL3_ADDRESS.parse().unwrap())
+        }
+        _ => DEFAULT_MULTICALL3_ADDRESS.parse().unwrap(),
+    }
+}
+
+/// Helper to detect if an error looks like the Multicall3 contract isn't deployed.
+fn result_hex_looks_like_no_contract(error: &str) -> bool {
+    // Empty result often means no contract at that address
+    error == "0x" || error.is_empty() || error.contains("0x0")
+}
+
+/// Prefetches view calls for a batch of events using Multicall3.
+/// This batches multiple eth_call requests into a single RPC call per network/block.
+/// Results are stored in VIEW_CALL_CACHE (for regular calls) or STATIC_CALL_CACHE (for static calls).
+/// Falls back to individual calls if Multicall3 is not available on a network.
+async fn prefetch_view_calls(
+    tables: &[TableRuntime],
+    event_name: &str,
+    events_data: &[(Vec<LogParam>, String, TxMetadata)],
+    providers: &std::collections::HashMap<String, Arc<JsonRpcCachedProvider>>,
+    constants: &Constants,
+    multicall_addresses: &std::collections::HashMap<String, Option<String>>,
+) {
+    use std::collections::HashSet;
+
+    // Exit early if shutdown requested
+    if !is_running() {
+        return;
+    }
+
+    // Count events per network and track block ranges for progress tracking
+    let mut events_per_network: HashMap<String, usize> = HashMap::new();
+    let mut block_range_per_network: HashMap<String, (u64, u64)> = HashMap::new(); // (min, max)
+    for (_, network, tx_metadata) in events_data {
+        *events_per_network.entry(network.clone()).or_default() += 1;
+        let block = tx_metadata.block_number;
+        block_range_per_network
+            .entry(network.clone())
+            .and_modify(|(min, max)| {
+                if block < *min {
+                    *min = block;
+                }
+                if block > *max {
+                    *max = block;
+                }
+            })
+            .or_insert((block, block));
+    }
+
+    // Collect all unique view calls needed - separate regular and static calls
+    let mut pending_calls: Vec<PendingViewCall> = Vec::new();
+    let mut pending_static_calls: Vec<PendingViewCall> = Vec::new();
+    let mut seen_cache_keys: HashSet<ViewCallCacheKey> = HashSet::new();
+    let mut seen_static_keys: HashSet<StaticCallCacheKey> = HashSet::new();
+
+    // Track how many events are at each (network, block) for progress
+    let mut events_per_block: HashMap<(String, u64), usize> = HashMap::new();
+    for (_, network, tx_metadata) in events_data {
+        *events_per_block.entry((network.clone(), tx_metadata.block_number)).or_default() += 1;
+    }
+
+    // Check what's already in cache
+    {
+        let cache = VIEW_CALL_CACHE.read().await;
+        for key in cache.keys() {
+            seen_cache_keys.insert(key.clone());
+        }
+    }
+    {
+        let cache = STATIC_CALL_CACHE.read().await;
+        for key in cache.keys() {
+            seen_static_keys.insert(key.clone());
+        }
+    }
+
+    // Scan all table operations for $call patterns
+    for table_runtime in tables {
+        let event_mapping = match table_runtime.table.events.iter().find(|e| e.event == event_name)
+        {
+            Some(em) => em,
+            None => continue,
+        };
+
+        for operation in &event_mapping.operations {
+            // Collect value refs that might contain $call
+            let mut value_refs: Vec<&str> = Vec::new();
+
+            for value_ref in operation.where_clause.values() {
+                value_refs.push(value_ref.as_str());
+            }
+            for set_col in &operation.set {
+                value_refs.push(set_col.effective_value());
+            }
+
+            // For each event, try to resolve calls
+            for (log_params, network, tx_metadata) in events_data {
+                // Expand iterate bindings
+                let expanded_params_list =
+                    match expand_iterate_bindings(&event_mapping.iterate, log_params) {
+                        Some(params) => params,
+                        None => continue,
+                    };
+
+                for expanded_log_params in &expanded_params_list {
+                    for value_ref in &value_refs {
+                        // Find all $call patterns in this value
+                        let call_patterns = find_call_patterns(value_ref);
+                        for (_, _, call_expr) in call_patterns {
+                            if let Some(view_call) = parse_view_call(&call_expr) {
+                                // Try to resolve the call to concrete values
+                                if let Some(pending) = resolve_view_call_to_pending(
+                                    &view_call,
+                                    expanded_log_params,
+                                    tx_metadata,
+                                    network,
+                                    constants,
+                                ) {
+                                    if view_call.is_static {
+                                        // Static calls use (network, target, calldata) as key - no block
+                                        let static_key = (
+                                            pending.network.clone(),
+                                            pending.target,
+                                            pending.calldata.clone(),
+                                        );
+                                        if !seen_static_keys.contains(&static_key) {
+                                            seen_static_keys.insert(static_key);
+                                            pending_static_calls.push(pending);
+                                        }
+                                    } else {
+                                        // Regular calls include block in the key
+                                        let cache_key = (
+                                            pending.network.clone(),
+                                            pending.target,
+                                            pending.calldata.clone(),
+                                            pending.block_number,
+                                        );
+                                        if !seen_cache_keys.contains(&cache_key) {
+                                            seen_cache_keys.insert(cache_key);
+                                            pending_calls.push(pending);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        // Also check if the value itself is a direct $call
+                        if is_view_call(value_ref) {
+                            if let Some(view_call) = parse_view_call(value_ref) {
+                                if let Some(pending) = resolve_view_call_to_pending(
+                                    &view_call,
+                                    expanded_log_params,
+                                    tx_metadata,
+                                    network,
+                                    constants,
+                                ) {
+                                    if view_call.is_static {
+                                        let static_key = (
+                                            pending.network.clone(),
+                                            pending.target,
+                                            pending.calldata.clone(),
+                                        );
+                                        if !seen_static_keys.contains(&static_key) {
+                                            seen_static_keys.insert(static_key);
+                                            pending_static_calls.push(pending);
+                                        }
+                                    } else {
+                                        let cache_key = (
+                                            pending.network.clone(),
+                                            pending.target,
+                                            pending.calldata.clone(),
+                                            pending.block_number,
+                                        );
+                                        if !seen_cache_keys.contains(&cache_key) {
+                                            seen_cache_keys.insert(cache_key);
+                                            pending_calls.push(pending);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let total_calls = pending_calls.len() + pending_static_calls.len();
+    if total_calls == 0 {
+        return;
+    }
+
+    let start = std::time::Instant::now();
+    let total_events: usize = events_per_network.values().sum();
+
+    // Execute static calls first (grouped by network only, use latest block)
+    if !pending_static_calls.is_empty() {
+        prefetch_static_calls_via_multicall(pending_static_calls, providers, multicall_addresses)
+            .await;
+    }
+
+    // Then execute regular calls (grouped by network+block)
+    if pending_calls.is_empty() {
+        return;
+    }
+
+    // Check which networks have multicall disabled at runtime
+    let networks_without_multicall = NETWORKS_WITHOUT_MULTICALL3.read().await;
+
+    // Group calls by (network, block_number) for batching
+    let mut grouped: std::collections::HashMap<(String, u64), Vec<PendingViewCall>> =
+        std::collections::HashMap::new();
+    for call in &pending_calls {
+        grouped.entry((call.network.clone(), call.block_number)).or_default().push(call.clone());
+    }
+
+    // Create atomic counters for events processed per network
+    let processed_per_network: HashMap<String, Arc<std::sync::atomic::AtomicUsize>> =
+        events_per_network
+            .keys()
+            .map(|net| (net.clone(), Arc::new(std::sync::atomic::AtomicUsize::new(0))))
+            .collect();
+
+    // Execute batches in parallel with adaptive concurrency
+    let mut batch_futures = Vec::new();
+
+    // Create a shared semaphore based on initial adaptive limit
+    let initial_limit = ADAPTIVE_CONCURRENCY.current();
+    let initial_batch_size = ADAPTIVE_CONCURRENCY.current_batch_size();
+    let adaptive_semaphore = Arc::new(tokio::sync::Semaphore::new(initial_limit));
+    info!(
+        "Starting $call resolution: {} concurrent batches, {} calls/batch (adaptive)",
+        initial_limit, initial_batch_size
+    );
+
+    for ((network, block_number), calls) in grouped {
+        if networks_without_multicall.contains(&network) {
+            continue;
+        }
+
+        let multicall_config = multicall_addresses.get(&network).and_then(|v| v.as_deref());
+        let multicall_address = get_multicall3_address(multicall_config);
+
+        let provider = match providers.get(&network) {
+            Some(p) => Arc::clone(p),
+            None => continue,
+        };
+
+        // Get event count for this (network, block)
+        let events_at_block = *events_per_block.get(&(network.clone(), block_number)).unwrap_or(&0);
+        let processed_counter = processed_per_network.get(&network).cloned();
+
+        // Use adaptive batch size
+        let batch_size = ADAPTIVE_CONCURRENCY.current_batch_size();
+        for chunk in calls.chunks(batch_size) {
+            let chunk_vec: Vec<PendingViewCall> = chunk.to_vec();
+            let network_clone = network.clone();
+            let provider_clone = Arc::clone(&provider);
+            let semaphore = adaptive_semaphore.clone();
+            let counter = processed_counter.clone();
+            let block_num = block_number;
+
+            batch_futures.push(tokio::spawn(async move {
+                let _permit = semaphore.acquire().await.ok()?;
+                // Wait for backoff if rate limited (for free nodes)
+                ADAPTIVE_CONCURRENCY.wait_for_backoff().await;
+                let result = execute_multicall3_batch(
+                    &provider_clone,
+                    &network_clone,
+                    block_num,
+                    &chunk_vec,
+                    multicall_address,
+                )
+                .await;
+
+                // Report to adaptive concurrency controller
+                match &result {
+                    Ok(_) => {
+                        ADAPTIVE_CONCURRENCY.record_success();
+                    }
+                    Err(e) => {
+                        let err_str = e.to_string().to_lowercase();
+                        if err_str.contains("429")
+                            || err_str.contains("rate limit")
+                            || err_str.contains("too many")
+                        {
+                            ADAPTIVE_CONCURRENCY.record_rate_limit();
+                        } else {
+                            ADAPTIVE_CONCURRENCY.record_error();
+                        }
+                    }
+                }
+
+                // Add events for this block to processed count
+                if let Some(c) = counter {
+                    c.fetch_add(events_at_block, std::sync::atomic::Ordering::Relaxed);
+                }
+                result.ok()
+            }));
+        }
+    }
+
+    drop(networks_without_multicall);
+
+    // Increment global fetched counters for this batch
+    for (network, count) in &events_per_network {
+        increment_events_fetched(event_name, network, *count).await;
+    }
+
+    // Spawn progress reporter (logs every 2 seconds per network, sorted alphabetically)
+    let mut networks: Vec<String> = events_per_network.keys().cloned().collect();
+    networks.sort();
+    let processed_for_reporter: HashMap<String, Arc<std::sync::atomic::AtomicUsize>> =
+        processed_per_network.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+    let event_name_clone = event_name.to_string();
+    let block_ranges = block_range_per_network.clone();
+    let stop_signal = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stop_signal_clone = stop_signal.clone();
+
+    let progress_handle = tokio::spawn(async move {
+        loop {
+            // Sleep in small intervals, checking stop signal and global shutdown frequently
+            for _ in 0..20 {
+                if stop_signal_clone.load(std::sync::atomic::Ordering::Relaxed) || !is_running() {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+
+            let mut all_done = true;
+            let mut total_processed: usize = 0;
+
+            for network in &networks {
+                let fetched = get_events_fetched(&event_name_clone, network).await;
+
+                if let Some(batch_counter) = processed_for_reporter.get(network) {
+                    let batch_done = batch_counter.load(std::sync::atomic::Ordering::Relaxed);
+                    let global_processed =
+                        get_events_processed(&event_name_clone, network).await + batch_done;
+                    total_processed += global_processed;
+
+                    if global_processed < fetched {
+                        all_done = false;
+                        let block_range = block_ranges
+                            .get(network)
+                            .map(|(min, max)| format!("blocks {}-{}", min, max))
+                            .unwrap_or_default();
+                        info!(
+                            "{}::{} - IN-PROGRESS - {} - {} events - $call {}/{} ({:.0}%) - (total: {})",
+                            event_name_clone,
+                            network,
+                            block_range,
+                            fetched,
+                            global_processed,
+                            fetched,
+                            (global_processed as f64 / fetched as f64) * 100.0,
+                            total_processed
+                        );
+                    }
+                }
+            }
+            if all_done {
+                break;
+            }
+        }
+    });
+
+    // Wait for batches with shutdown check - abort immediately if shutdown requested
+    // Convert to JoinHandles we can abort
+    let handles: Vec<_> = batch_futures;
+
+    // Poll for completion while checking shutdown signal
+    let mut completed = 0;
+    let total_batches = handles.len();
+
+    loop {
+        // Check for shutdown - abort all remaining tasks immediately
+        if !is_running() {
+            info!(
+                "Shutdown requested - aborting {} remaining RPC batches",
+                total_batches - completed
+            );
+            for handle in &handles {
+                handle.abort();
+            }
+            stop_signal.store(true, std::sync::atomic::Ordering::Relaxed);
+            progress_handle.abort();
+            // Don't update progress counters - this batch wasn't completed
+            return;
+        }
+
+        // Check if all done
+        let all_done = handles.iter().all(|h| h.is_finished());
+        if all_done {
+            break;
+        }
+
+        // Count completed for logging
+        completed = handles.iter().filter(|h| h.is_finished()).count();
+
+        // Brief sleep to avoid busy-waiting
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    stop_signal.store(true, std::sync::atomic::Ordering::Relaxed);
+    progress_handle.abort();
+
+    // Collect results from completed handles
+    let mut failed_count = 0;
+    for handle in handles {
+        if handle.await.is_err() {
+            failed_count += 1;
+        }
+    }
+    if failed_count > 0 {
+        warn!("{} RPC batches failed (will fallback to individual calls)", failed_count);
+    }
+
+    // Increment global processed counters for this batch
+    for (network, count) in &events_per_network {
+        increment_events_processed(event_name, network, *count).await;
+    }
+
+    info!("{} - {} events resolved in {:?}", event_name, total_events, start.elapsed());
+}
+
+/// Prefetches static view calls (symbol, decimals, etc.) using Multicall3.
+/// Groups ALL static calls by network and executes in large batches.
+/// Uses "latest" block since static data doesn't change.
+/// Results are stored in STATIC_CALL_CACHE.
+async fn prefetch_static_calls_via_multicall(
+    pending_calls: Vec<PendingViewCall>,
+    providers: &std::collections::HashMap<String, Arc<JsonRpcCachedProvider>>,
+    multicall_addresses: &std::collections::HashMap<String, Option<String>>,
+) {
+    if pending_calls.is_empty() {
+        return;
+    }
+
+    // Check which networks have multicall disabled
+    let networks_without_multicall = NETWORKS_WITHOUT_MULTICALL3.read().await;
+
+    // Group ALL calls by network only (not by block - static calls use latest)
+    let mut grouped: std::collections::HashMap<String, Vec<PendingViewCall>> =
+        std::collections::HashMap::new();
+    for call in pending_calls {
+        grouped.entry(call.network.clone()).or_default().push(call);
+    }
+
+    let mut batch_futures = Vec::new();
+
+    // Create a shared semaphore based on adaptive limit
+    let adaptive_semaphore = Arc::new(tokio::sync::Semaphore::new(ADAPTIVE_CONCURRENCY.current()));
+
+    for (network, calls) in grouped {
+        if networks_without_multicall.contains(&network) {
+            debug!("Skipping static Multicall3 for {} (not available)", network);
+            continue;
+        }
+
+        let multicall_config = multicall_addresses.get(&network).and_then(|v| v.as_deref());
+        let multicall_address = get_multicall3_address(multicall_config);
+
+        let provider = match providers.get(&network) {
+            Some(p) => Arc::clone(p),
+            None => continue,
+        };
+
+        // Batch ALL calls for this network together (using adaptive batch size)
+        let batch_size = ADAPTIVE_CONCURRENCY.current_batch_size();
+        for chunk in calls.chunks(batch_size) {
+            let chunk_vec: Vec<PendingViewCall> = chunk.to_vec();
+            let network_clone = network.clone();
+            let provider_clone = Arc::clone(&provider);
+            let semaphore = adaptive_semaphore.clone();
+
+            batch_futures.push(tokio::spawn(async move {
+                let _permit = semaphore.acquire().await.ok()?;
+                // Wait for backoff if rate limited (for free nodes)
+                ADAPTIVE_CONCURRENCY.wait_for_backoff().await;
+                let result = execute_static_multicall3_batch(
+                    &provider_clone,
+                    &network_clone,
+                    &chunk_vec,
+                    multicall_address,
+                )
+                .await;
+
+                // Report to adaptive concurrency controller
+                match &result {
+                    Ok(_) => {
+                        ADAPTIVE_CONCURRENCY.record_success();
+                    }
+                    Err(e) => {
+                        let err_str = e.to_string().to_lowercase();
+                        if err_str.contains("429")
+                            || err_str.contains("rate limit")
+                            || err_str.contains("too many")
+                        {
+                            ADAPTIVE_CONCURRENCY.record_rate_limit();
+                        } else {
+                            ADAPTIVE_CONCURRENCY.record_error();
+                        }
+                    }
+                }
+
+                result.ok()
+            }));
+        }
+    }
+
+    drop(networks_without_multicall);
+
+    if batch_futures.is_empty() {
+        return;
+    }
+
+    // Wait for batches with shutdown check - abort immediately if shutdown requested
+    let handles: Vec<_> = batch_futures;
+
+    loop {
+        // Check for shutdown - abort all remaining tasks immediately
+        if !is_running() {
+            info!("Shutdown requested - aborting {} static RPC batches", handles.len());
+            for handle in &handles {
+                handle.abort();
+            }
+            return;
+        }
+
+        // Check if all done
+        if handles.iter().all(|h| h.is_finished()) {
+            break;
+        }
+
+        // Brief sleep to avoid busy-waiting
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    // Collect results
+    let mut failed = 0;
+    for handle in handles {
+        if handle.await.is_err() {
+            failed += 1;
+        }
+    }
+    if failed > 0 {
+        warn!("Static batches: {} failed (will fallback to individual calls)", failed);
+    }
+}
+
+/// Executes a batch of STATIC view calls using Multicall3 at "latest" block.
+/// Results are stored in STATIC_CALL_CACHE (no block number in key).
+async fn execute_static_multicall3_batch(
+    provider: &JsonRpcCachedProvider,
+    network: &str,
+    calls: &[PendingViewCall],
+    multicall_address: Address,
+) -> Result<(), String> {
+    if calls.is_empty() {
+        return Ok(());
+    }
+
+    debug!("Multicall3::{} - static batch of {} calls", network, calls.len());
+
+    // Build aggregate3 calldata
+    let selector = hex::decode("82ad56cb").unwrap();
+
+    let call3_tuples: Vec<DynSolValue> = calls
+        .iter()
+        .map(|c| {
+            DynSolValue::Tuple(vec![
+                DynSolValue::Address(c.target),
+                DynSolValue::Bool(true),
+                DynSolValue::Bytes(c.calldata.to_vec()),
+            ])
+        })
+        .collect();
+
+    let encoded_calls = DynSolValue::Array(call3_tuples).abi_encode_params();
+    let mut calldata = selector;
+    calldata.extend(encoded_calls);
+
+    // Execute at LATEST block using eth_call_latest
+    let result_hex = match provider.eth_call_latest(multicall_address, Bytes::from(calldata)).await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            let error_str = e.to_string();
+            if error_str.contains("execution reverted")
+                || error_str.contains("contract")
+                || error_str.is_empty()
+                || result_hex_looks_like_no_contract(&error_str)
+            {
+                warn!("Multicall3 not available on {} - falling back to individual calls", network);
+                let mut no_multicall = NETWORKS_WITHOUT_MULTICALL3.write().await;
+                no_multicall.insert(network.to_string());
+            }
+            return Err(format!("Static Multicall3 failed on {}: {}", network, e));
+        }
+    };
+
+    // Skip cache work if shutdown requested - RPC completed but we're exiting
+    if !is_running() {
+        return Ok(());
+    }
+
+    // Decode results
+    let result_bytes = hex::decode(result_hex.trim_start_matches("0x"))
+        .map_err(|e| format!("Hex decode: {}", e))?;
+
+    let result_type =
+        DynSolType::Array(Box::new(DynSolType::Tuple(vec![DynSolType::Bool, DynSolType::Bytes])));
+
+    let decoded =
+        result_type.abi_decode(&result_bytes).map_err(|e| format!("ABI decode failed: {}", e))?;
+
+    let results = match decoded {
+        DynSolValue::Array(arr) => arr,
+        _ => return Err("Unexpected result type".to_string()),
+    };
+
+    // Store results in STATIC cache (no block number in key)
+    let mut cache = STATIC_CALL_CACHE.write().await;
+    let mut cached_count = 0;
+
+    for (i, result) in results.into_iter().enumerate() {
+        if i >= calls.len() {
+            break;
+        }
+
+        let call = &calls[i];
+        // Static cache key: (network, target, calldata) - NO block number
+        let cache_key = (call.network.clone(), call.target, call.calldata.clone());
+
+        if let DynSolValue::Tuple(fields) = result {
+            if fields.len() >= 2 {
+                let success = matches!(fields[0], DynSolValue::Bool(true));
+                if success {
+                    if let DynSolValue::Bytes(return_data) = &fields[1] {
+                        if let Some(decoded_value) = try_decode_return_value(return_data) {
+                            cache.insert(cache_key, decoded_value);
+                            cached_count += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    debug!("Multicall3::{} - cached {}/{} static results", network, cached_count, calls.len());
+
+    Ok(())
+}
+
+/// Resolves a ViewCall to a PendingViewCall with concrete address and calldata.
+fn resolve_view_call_to_pending(
+    view_call: &ViewCall,
+    log_params: &[LogParam],
+    tx_metadata: &TxMetadata,
+    network: &str,
+    constants: &Constants,
+) -> Option<PendingViewCall> {
+    use alloy::primitives::keccak256;
+
+    // Resolve contract address
+    let contract_address: Address = if view_call.contract_address.starts_with("$constant(") {
+        let resolved = resolve_constants_in_value(&view_call.contract_address, constants, network)?;
+        resolved.parse().ok()?
+    } else if view_call.contract_address.starts_with('$') {
+        let field_name = &view_call.contract_address[1..];
+        if field_name == "rindexer_contract_address" {
+            tx_metadata.contract_address
+        } else {
+            let value = resolve_field_path(field_name, log_params)?;
+            match value {
+                DynSolValue::Address(addr) => addr,
+                _ => return None,
+            }
+        }
+    } else {
+        view_call.contract_address.parse().ok()?
+    };
+
+    // Parse function signature
+    let (_, param_types) = parse_function_signature(&view_call.function_sig)?;
+
+    // Build function selector
+    let selector = &keccak256(view_call.function_sig.as_bytes())[..4];
+
+    // Encode arguments
+    let mut encoded_args = Vec::new();
+    for (i, arg_str) in view_call.args.iter().enumerate() {
+        let param_type = param_types.get(i)?;
+        let value =
+            resolve_arg_value(arg_str, log_params, tx_metadata, param_type, constants, network)?;
+        encoded_args.push(value);
+    }
+
+    // Build calldata
+    let calldata = if encoded_args.is_empty() {
+        Bytes::copy_from_slice(selector)
+    } else {
+        let encoded = DynSolValue::Tuple(encoded_args).abi_encode_params();
+        let mut data = selector.to_vec();
+        data.extend(encoded);
+        Bytes::from(data)
+    };
+
+    Some(PendingViewCall {
+        target: contract_address,
+        calldata,
+        block_number: tx_metadata.block_number,
+        network: network.to_string(),
+    })
+}
+
+/// Executes a batch of view calls using Multicall3's aggregate3 function.
+/// Results are stored in the VIEW_CALL_CACHE.
+/// If the call fails (e.g., Multicall3 not deployed), marks the network as not having Multicall3.
+async fn execute_multicall3_batch(
+    provider: &JsonRpcCachedProvider,
+    network: &str,
+    block_number: u64,
+    calls: &[PendingViewCall],
+    multicall_address: Address,
+) -> Result<(), String> {
+    if calls.is_empty() {
+        return Ok(());
+    }
+
+    debug!("Multicall3::{} - batch of {} calls at block {}", network, calls.len(), block_number);
+
+    // Build aggregate3 calldata
+    // aggregate3((address,bool,bytes)[]) selector = 0x82ad56cb
+    let selector = hex::decode("82ad56cb").unwrap();
+
+    // Encode Call3 array: [(address target, bool allowFailure, bytes callData), ...]
+    let call3_tuples: Vec<DynSolValue> = calls
+        .iter()
+        .map(|c| {
+            DynSolValue::Tuple(vec![
+                DynSolValue::Address(c.target),
+                DynSolValue::Bool(true), // allowFailure = true so one failure doesn't fail all
+                DynSolValue::Bytes(c.calldata.to_vec()),
+            ])
+        })
+        .collect();
+
+    let encoded_calls = DynSolValue::Array(call3_tuples).abi_encode_params();
+    let mut calldata = selector;
+    calldata.extend(encoded_calls);
+
+    // Execute the multicall
+    let result_hex = match provider
+        .eth_call(multicall_address, Bytes::from(calldata), block_number)
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            let error_str = e.to_string();
+            // Check if this looks like a "contract not found" error
+            // Common error messages: "execution reverted", "contract not deployed", empty response
+            if error_str.contains("execution reverted")
+                || error_str.contains("contract")
+                || error_str.is_empty()
+                || result_hex_looks_like_no_contract(&error_str)
+            {
+                warn!("Multicall3 not available on {} - falling back to individual calls", network);
+                // Mark this network as not having Multicall3
+                let mut no_multicall = NETWORKS_WITHOUT_MULTICALL3.write().await;
+                no_multicall.insert(network.to_string());
+            }
+            return Err(format!("Multicall3 failed on {}: {}", network, e));
+        }
+    };
+
+    // Decode the results: Result[] = [(bool success, bytes returnData), ...]
+    let result_bytes = hex::decode(result_hex.trim_start_matches("0x"))
+        .map_err(|e| format!("Hex decode: {}", e))?;
+
+    // The result is ABI encoded as: bytes[] (dynamic array of bytes)
+    // aggregate3 returns (Result[] memory returnData) where Result = (bool success, bytes returnData)
+    let result_type =
+        DynSolType::Array(Box::new(DynSolType::Tuple(vec![DynSolType::Bool, DynSolType::Bytes])));
+
+    // Skip cache work if shutdown requested - RPC completed but we're exiting
+    if !is_running() {
+        return Ok(());
+    }
+
+    let decoded =
+        result_type.abi_decode(&result_bytes).map_err(|e| format!("ABI decode failed: {}", e))?;
+
+    let results = match decoded {
+        DynSolValue::Array(arr) => arr,
+        _ => return Err("Unexpected result type".to_string()),
+    };
+
+    // Store results in cache
+    let mut cache = VIEW_CALL_CACHE.write().await;
+    let mut cached_count = 0;
+
+    for (i, result) in results.into_iter().enumerate() {
+        if i >= calls.len() {
+            break;
+        }
+
+        let call = &calls[i];
+        let cache_key =
+            (call.network.clone(), call.target, call.calldata.clone(), call.block_number);
+
+        // Extract (success, returnData) from the tuple
+        if let DynSolValue::Tuple(fields) = result {
+            if fields.len() >= 2 {
+                let success = matches!(fields[0], DynSolValue::Bool(true));
+                if success {
+                    if let DynSolValue::Bytes(return_data) = &fields[1] {
+                        // Try to decode the return value
+                        if let Some(decoded_value) = try_decode_return_value(return_data) {
+                            cache.insert(cache_key, decoded_value);
+                            cached_count += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    drop(cache);
+
+    debug!("Multicall3::{} - cached {}/{} results", network, cached_count, calls.len());
+
+    // Skip eviction if shutdown requested
+    if !is_running() {
+        return Ok(());
+    }
+
+    // Evict old entries if cache is getting large
+    evict_old_view_call_cache_entries().await;
+
+    Ok(())
+}
+
+/// Prefetches block timestamps for a batch of events that need them.
+/// This is called once at the start of table processing to batch all RPC calls together.
+/// Results are stored in the global BLOCK_TIMESTAMP_CACHE.
+async fn prefetch_block_timestamps(
+    events_data: &[(Vec<LogParam>, String, TxMetadata)],
+    providers: &std::collections::HashMap<String, Arc<JsonRpcCachedProvider>>,
+    needs_timestamp: bool,
+) {
+    if !needs_timestamp {
+        return;
+    }
+
+    // Exit early if shutdown requested
+    if !is_running() {
+        return;
+    }
+
+    // Collect unique (network, block_number) pairs that need fetching
+    let mut blocks_to_fetch: HashMap<String, Vec<u64>> = HashMap::new();
+
+    {
+        let cache = BLOCK_TIMESTAMP_CACHE.read().await;
+        for (_, network, tx_metadata) in events_data {
+            // Skip if we already have the timestamp in metadata
+            if tx_metadata.block_timestamp.is_some() {
+                continue;
+            }
+
+            // Skip if already cached
+            let cache_key = (network.clone(), tx_metadata.block_number);
+            if cache.contains_key(&cache_key) {
+                continue;
+            }
+
+            // Add to fetch list
+            blocks_to_fetch.entry(network.clone()).or_default().push(tx_metadata.block_number);
+        }
+    }
+
+    // Deduplicate block numbers per network
+    for blocks in blocks_to_fetch.values_mut() {
+        blocks.sort_unstable();
+        blocks.dedup();
+    }
+
+    // Spawn tasks for parallel fetching with adaptive concurrency
+    let mut handles = Vec::new();
+
+    // Create adaptive semaphore based on current concurrency level
+    let adaptive_semaphore = Arc::new(tokio::sync::Semaphore::new(ADAPTIVE_CONCURRENCY.current()));
+
+    for (network, block_numbers) in blocks_to_fetch {
+        if block_numbers.is_empty() {
+            continue;
+        }
+
+        let Some(provider) = providers.get(&network).cloned() else {
+            warn!("No provider for network {} to fetch block timestamps", network);
+            continue;
+        };
+
+        // Split into batches using adaptive batch size
+        let batch_size = ADAPTIVE_CONCURRENCY.current_batch_size();
+        for chunk in block_numbers.chunks(batch_size) {
+            let network_clone = network.clone();
+            let provider_clone = Arc::clone(&provider);
+            let block_numbers_u64: Vec<U64> = chunk.iter().map(|&n| U64::from(n)).collect();
+            let semaphore = adaptive_semaphore.clone();
+
+            let rpc_batch_size = batch_size;
+            handles.push(tokio::spawn(async move {
+                let _permit = semaphore.acquire().await.ok()?;
+                // Wait for backoff if rate limited (for free nodes)
+                ADAPTIVE_CONCURRENCY.wait_for_backoff().await;
+
+                match provider_clone
+                    .get_block_by_number_batch_with_size(
+                        &block_numbers_u64,
+                        false,
+                        Some(rpc_batch_size),
+                    )
+                    .await
+                {
+                    Ok(blocks) => {
+                        ADAPTIVE_CONCURRENCY.record_success();
+                        Some((network_clone, blocks))
+                    }
+                    Err(e) => {
+                        let err_str = e.to_string().to_lowercase();
+                        if err_str.contains("429")
+                            || err_str.contains("rate limit")
+                            || err_str.contains("too many")
+                        {
+                            ADAPTIVE_CONCURRENCY.record_rate_limit();
+                        } else {
+                            ADAPTIVE_CONCURRENCY.record_error();
+                        }
+                        warn!(
+                            "Failed to batch fetch block timestamps for {}: {}",
+                            network_clone, e
+                        );
+                        None
+                    }
+                }
+            }));
+        }
+    }
+
+    if handles.is_empty() {
+        return;
+    }
+
+    // Wait for completion with shutdown check - abort immediately if requested
+    loop {
+        if !is_running() {
+            info!("Shutdown requested - aborting {} timestamp fetch tasks", handles.len());
+            for handle in &handles {
+                handle.abort();
+            }
+            return;
+        }
+
+        if handles.iter().all(|h| h.is_finished()) {
+            break;
+        }
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    // Collect results and insert into cache (skip eviction if shutdown)
+    for handle in handles {
+        if let Ok(Some((network, blocks))) = handle.await {
+            // Skip cache work if shutdown requested
+            if !is_running() {
+                continue;
+            }
+            {
+                let mut cache = BLOCK_TIMESTAMP_CACHE.write().await;
+                for block in blocks {
+                    let block_num = block.header.number;
+                    let timestamp = block.header.timestamp;
+                    cache.insert((network.clone(), block_num), timestamp);
+                }
+            }
+            // Evict old entries if cache is getting large (skip during shutdown)
+            if is_running() {
+                evict_old_block_timestamp_cache_entries().await;
+            }
+        }
+    }
+}
+
+/// Gets a block timestamp from the cache, or returns None if not cached.
+/// Should be called after prefetch_block_timestamps has populated the cache.
+async fn get_cached_block_timestamp(network: &str, block_number: u64) -> Option<u64> {
+    let cache = BLOCK_TIMESTAMP_CACHE.read().await;
+    cache.get(&(network.to_string(), block_number)).copied()
+}
+
+/// Transaction metadata available for table value references.
+#[derive(Clone, Debug)]
+pub struct TxMetadata {
+    pub block_number: u64,
+    pub block_timestamp: Option<U256>,
+    pub tx_hash: B256,
+    pub block_hash: B256,
+    pub contract_address: Address,
+    pub log_index: U256,
+    pub tx_index: u64,
+}
+
+/// Runtime representation of a table with resolved table name.
+#[derive(Clone, Debug)]
+pub struct TableRuntime {
+    pub table: Table,
+    pub full_table_name: String,
+    pub indexer_name: String,
+    pub contract_name: String,
+}
+
+impl TableRuntime {
+    pub fn new(table: Table, indexer_name: &str, contract_name: &str) -> Self {
+        let full_table_name = generate_table_full_name(indexer_name, contract_name, &table.name);
+        Self {
+            table,
+            full_table_name,
+            indexer_name: indexer_name.to_string(),
+            contract_name: contract_name.to_string(),
+        }
+    }
+}
+
+/// Data for a single table row to be processed.
+#[derive(Debug)]
+pub struct TableRowData {
+    /// Column values keyed by column name
+    pub columns: HashMap<String, EthereumSqlTypeWrapper>,
+    /// Network for this row
+    pub network: String,
+}
+
+/// Checks if a value string contains arithmetic operators indicating it's a computed expression.
+/// Computed expressions like "$value * 2", "$amount + $fee", "$ratio / 100", "10 ^ $decimals" will return true.
+/// Also supports $call() in arithmetic: "$amount / (10 ^ $call($asset, \"decimals()\"))"
+fn is_arithmetic_expression(value: &str) -> bool {
+    // Must contain at least one arithmetic operator
+    // Check for operators that are not part of comparison (==, !=, >=, <=)
+    let has_operator = value.chars().enumerate().any(|(i, c)| {
+        if c == '*' || c == '/' || c == '^' {
+            true
+        } else if c == '+' || c == '-' {
+            // Check it's not a unary operator at the start
+            i > 0
+        } else {
+            false
+        }
+    });
+
+    // Must have operators AND contain either $field or $call references
+    has_operator && (value.contains('$'))
+}
+
+/// Checks if an arithmetic expression contains $call() or $call_static() patterns that need async resolution.
+fn arithmetic_has_calls(value: &str) -> bool {
+    value.contains("$call(") || value.contains("$call_static(")
+}
+
+/// Checks if a value string is a conditional expression like `$if(condition, trueValue, falseValue)`.
+fn is_conditional_value(value: &str) -> bool {
+    value.starts_with("$if(") && value.ends_with(')')
+}
+
+/// Parses a conditional expression `$if(condition, trueValue, falseValue)`.
+/// Returns (condition, true_value, false_value) or an error.
+fn parse_conditional_value(value: &str) -> Result<(String, String, String), String> {
+    // Strip "$if(" prefix and ")" suffix
+    let inner = value
+        .strip_prefix("$if(")
+        .and_then(|s| s.strip_suffix(')'))
+        .ok_or_else(|| "Invalid $if() syntax".to_string())?;
+
+    // Split by commas, but respect nested parentheses
+    let mut parts = Vec::new();
+    let mut current = String::new();
+    let mut depth = 0;
+
+    for c in inner.chars() {
+        match c {
+            '(' => {
+                depth += 1;
+                current.push(c);
+            }
+            ')' => {
+                depth -= 1;
+                current.push(c);
+            }
+            ',' if depth == 0 => {
+                parts.push(current.trim().to_string());
+                current = String::new();
+            }
+            _ => current.push(c),
+        }
+    }
+    parts.push(current.trim().to_string());
+
+    if parts.len() != 3 {
+        return Err(format!(
+            "Invalid $if() syntax: expected 3 arguments (condition, trueValue, falseValue), got {}",
+            parts.len()
+        ));
+    }
+
+    Ok((parts[0].clone(), parts[1].clone(), parts[2].clone()))
+}
+
+/// Finds all $call(...) and $call_static(...) patterns in a string, handling nested parentheses.
+/// Returns a vector of (start_index, end_index, call_expression) for each match.
+fn find_call_patterns(value: &str) -> Vec<(usize, usize, String)> {
+    let mut results = Vec::new();
+    let mut search_start = 0;
+
+    while search_start < value.len() {
+        // Find the next $call( or $call_static( pattern
+        let remaining = &value[search_start..];
+        let (absolute_start, prefix_len) =
+            match (remaining.find("$call_static("), remaining.find("$call(")) {
+                (Some(static_pos), Some(regular_pos)) => {
+                    // Check if $call( is actually part of $call_static(
+                    if regular_pos < static_pos {
+                        // Make sure this isn't a prefix of $call_static
+                        if remaining[regular_pos..].starts_with("$call_static(") {
+                            (search_start + static_pos, 13) // "$call_static("
+                        } else {
+                            (search_start + regular_pos, 6) // "$call("
+                        }
+                    } else {
+                        (search_start + static_pos, 13) // "$call_static("
+                    }
+                }
+                (Some(static_pos), None) => (search_start + static_pos, 13),
+                (None, Some(regular_pos)) => (search_start + regular_pos, 6),
+                (None, None) => break,
+            };
+
+        let call_start = absolute_start + prefix_len;
+
+        // Find matching closing paren, handling nested parens
+        let mut depth = 1;
+        let mut end_pos = None;
+
+        for (i, c) in value[call_start..].char_indices() {
+            match c {
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end_pos = Some(call_start + i);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        if let Some(end) = end_pos {
+            let call_expr = value[absolute_start..=end].to_string();
+            results.push((absolute_start, end + 1, call_expr));
+            search_start = end + 1;
+        } else {
+            // Malformed - no closing paren, skip this match
+            search_start = call_start;
+        }
+    }
+
+    results
+}
+
+/// Checks if a value string is a string template with embedded field references.
+/// String templates like "Pool: $token0/$token1" or "$from-$to" will return true.
+/// A single field reference like "$value" is NOT a template - it's a direct field access.
+fn is_string_template(value: &str) -> bool {
+    if !value.contains('$') {
+        return false;
+    }
+
+    // Pure field reference starts with $ and has no other content before it
+    // e.g., "$from" or "$data.amount" or "$ids[0]"
+    if let Some(after_dollar) = value.strip_prefix('$') {
+        // Simple heuristic: if it's a pure field reference, it should only contain
+        // alphanumeric, dots, underscores, and brackets
+        // String templates have extra characters like spaces, colons, slashes, etc.
+        let is_pure_field = after_dollar
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '.' || c == '_' || c == '[' || c == ']');
+
+        if is_pure_field {
+            return false;
+        }
+    }
+
+    // Has $ somewhere but isn't a pure field reference - it's a template
+    true
+}
+
+/// Expands a string template by replacing all `$field` references with their values.
+/// Returns None if any field reference cannot be resolved.
+fn expand_string_template(
+    template: &str,
+    log_params: &[LogParam],
+    tx_metadata: &TxMetadata,
+) -> Option<String> {
+    let mut result = String::with_capacity(template.len() * 2);
+    let mut chars = template.chars().peekable();
+
+    while let Some(c) = chars.next() {
+        if c == '$' {
+            // Extract the field name/path
+            let mut field_name = String::new();
+
+            while let Some(&next_c) = chars.peek() {
+                if next_c.is_alphanumeric()
+                    || next_c == '.'
+                    || next_c == '_'
+                    || next_c == '['
+                    || next_c == ']'
+                {
+                    field_name.push(chars.next().unwrap());
+                } else {
+                    break;
+                }
+            }
+
+            if field_name.is_empty() {
+                // Lone $ sign, keep it as is
+                result.push('$');
+                continue;
+            }
+
+            // Resolve the field value
+            let value_str = resolve_field_to_string(&field_name, log_params, tx_metadata)?;
+            result.push_str(&value_str);
+        } else {
+            result.push(c);
+        }
+    }
+
+    Some(result)
+}
+
+/// Resolves a field reference to its string representation.
+fn resolve_field_to_string(
+    field_name: &str,
+    log_params: &[LogParam],
+    tx_metadata: &TxMetadata,
+) -> Option<String> {
+    // Check for built-in transaction metadata fields first (all prefixed with rindexer_)
+    match field_name {
+        "rindexer_block_number" => return Some(tx_metadata.block_number.to_string()),
+        "rindexer_block_timestamp" => {
+            return tx_metadata.block_timestamp.map(|ts| ts.to_string());
+        }
+        "rindexer_tx_hash" => return Some(format!("{:?}", tx_metadata.tx_hash)),
+        "rindexer_block_hash" => return Some(format!("{:?}", tx_metadata.block_hash)),
+        "rindexer_contract_address" => return Some(format!("{:?}", tx_metadata.contract_address)),
+        "rindexer_log_index" => return Some(tx_metadata.log_index.to_string()),
+        "rindexer_tx_index" => return Some(tx_metadata.tx_index.to_string()),
+        _ => {}
+    }
+
+    // Resolve from log params
+    let value = resolve_field_path(field_name, log_params)?;
+    Some(dyn_sol_value_to_string(&value))
+}
+
+/// Converts a DynSolValue to a string representation suitable for concatenation.
+fn dyn_sol_value_to_string(value: &DynSolValue) -> String {
+    match value {
+        DynSolValue::Address(addr) => format!("{:?}", addr),
+        DynSolValue::Uint(val, _) => val.to_string(),
+        DynSolValue::Int(val, _) => val.to_string(),
+        DynSolValue::Bool(b) => b.to_string(),
+        DynSolValue::String(s) => s.clone(),
+        DynSolValue::Bytes(b) => format!("0x{}", hex::encode(b)),
+        DynSolValue::FixedBytes(b, _) => format!("0x{}", hex::encode(b)),
+        _ => format!("{:?}", value),
+    }
+}
+
+/// Checks if a value string is a view call expression like `$call(address, "signature", args...)`.
+/// May have accessor after: `$call(...)[0]` or `$call(...).fieldName`
+/// Also supports `$call_static(...)` for static data cached forever.
+fn is_view_call(value: &str) -> bool {
+    // Must start with $call( or $call_static( and have at least one closing paren
+    (value.starts_with("$call(") || value.starts_with("$call_static(")) && value.contains(')')
+}
+
+/// Checks if a value string is a constant reference like `$constant(name)`.
+fn is_constant_ref(value: &str) -> bool {
+    value.starts_with("$constant(") && value.ends_with(')')
+}
+
+/// Parses a `$constant(name)` expression and returns the constant name.
+fn parse_constant_ref(value: &str) -> Option<&str> {
+    if !is_constant_ref(value) {
+        return None;
+    }
+    // Extract the constant name between $constant( and )
+    let start = "$constant(".len();
+    let end = value.len() - 1; // Exclude the closing )
+    if start >= end {
+        return None;
+    }
+    Some(value[start..end].trim())
+}
+
+/// Resolves a constant reference to its value for the given network.
+/// Returns the resolved string value, or None if the constant doesn't exist
+/// or isn't defined for this network.
+fn resolve_constant<'a>(
+    constant_name: &str,
+    constants: &'a Constants,
+    network: &str,
+) -> Option<&'a str> {
+    constants.get(constant_name).and_then(|c| c.resolve(network))
+}
+
+/// Resolves all `$constant(name)` references in a string value.
+/// If the entire value is a constant reference, returns the resolved value.
+/// This does NOT do string interpolation - constants must be the entire value.
+fn resolve_constants_in_value<'a>(
+    value: &'a str,
+    constants: &'a Constants,
+    network: &str,
+) -> Option<String> {
+    if is_constant_ref(value) {
+        let name = parse_constant_ref(value)?;
+        resolve_constant(name, constants, network).map(|s| s.to_string())
+    } else {
+        // Not a constant reference, return as-is
+        Some(value.to_string())
+    }
+}
+
+/// Resolves all `$constant(name)` references embedded anywhere in a string value.
+/// Unlike `resolve_constants_in_value`, this handles constants inside larger expressions.
+/// e.g., "$call($constant(oracle), \"getPrice()\")" -> "$call(0x1234..., \"getPrice()\")"
+fn resolve_all_constants_in_value(
+    value: &str,
+    constants: &Constants,
+    network: &str,
+) -> Option<String> {
+    let mut result = value.to_string();
+    let mut search_start = 0;
+
+    while let Some(start) = result[search_start..].find("$constant(") {
+        let absolute_start = search_start + start;
+        let const_start = absolute_start + 10; // Skip "$constant("
+
+        // Find closing paren
+        if let Some(end_offset) = result[const_start..].find(')') {
+            let end = const_start + end_offset;
+            let const_name = &result[const_start..end];
+
+            // Resolve the constant
+            if let Some(resolved) = resolve_constant(const_name, constants, network) {
+                // Replace $constant(name) with the resolved value
+                result.replace_range(absolute_start..=end, resolved);
+                // Continue searching from after the replacement
+                search_start = absolute_start + resolved.len();
+            } else {
+                // Constant not found, skip this one
+                search_start = end + 1;
+            }
+        } else {
+            // Malformed - no closing paren
+            break;
+        }
+    }
+
+    Some(result)
+}
+
+/// Parsed view call expression.
+#[derive(Debug)]
+struct ViewCall {
+    contract_address: String, // Either literal address or $field reference
+    function_sig: String,     // e.g., "balanceOf(address)" or "decimals()"
+    args: Vec<String>,        // Argument values (can be $field references)
+    accessor: Option<String>, // Optional accessor like "[0]" or ".fieldName" or ".field[0].nested"
+    return_fields: Vec<ReturnField>, // Parsed from "returns (type name, ...)" if present
+    is_static: bool, // If true, use latest block and cache forever (for immutable data like symbol/decimals)
+}
+
+/// A parsed return field from "returns (type name, ...)" syntax.
+#[derive(Debug, Clone)]
+struct ReturnField {
+    name: String,
+    type_str: String,
+    children: Vec<ReturnField>, // For nested tuples like "(uint256 x, uint256 y) coords"
+}
+
+/// Parses a `$call(address, "signature", args...)` or `$call_static(...)` expression with optional accessor.
+/// Supports:
+/// - `$call($addr, "totalSupply()")` - simple, returns value directly
+/// - `$call($addr, "getReserves()")[0]` - position-based access
+/// - `$call($addr, "getReserves() returns (uint112 reserve0, uint112 reserve1)").reserve0` - named access
+/// - `$call_static($addr, "symbol()")` - static call, uses latest block and caches forever
+fn parse_view_call(value: &str) -> Option<ViewCall> {
+    // Determine if this is a static call
+    let is_static = value.starts_with("$call_static(");
+    let prefix = if is_static { "$call_static(" } else { "$call(" };
+    let start = prefix.len();
+
+    // Find the matching closing paren
+    let mut paren_depth = 1;
+    let mut call_end = None;
+
+    for (i, c) in value.chars().enumerate().skip(start) {
+        match c {
+            '(' => paren_depth += 1,
+            ')' => {
+                paren_depth -= 1;
+                if paren_depth == 0 {
+                    call_end = Some(i);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let call_end = call_end?;
+    let inner = &value[start..call_end];
+
+    // Extract accessor if present (everything after the closing paren)
+    let accessor = if call_end + 1 < value.len() {
+        let acc = value[call_end + 1..].trim();
+        if acc.is_empty() {
+            None
+        } else {
+            Some(acc.to_string())
+        }
+    } else {
+        None
+    };
+
+    // Split by comma, respecting quoted strings
+    let parts = split_call_args(inner);
+    if parts.len() < 2 {
+        return None;
+    }
+
+    let contract_address = parts[0].trim().to_string();
+    let full_sig = parts[1].trim().trim_matches('"').to_string();
+    let args: Vec<String> = parts[2..].iter().map(|s| s.trim().to_string()).collect();
+
+    // Parse "returns (...)" if present
+    let (function_sig, return_fields) = parse_function_sig_with_returns(&full_sig);
+
+    Some(ViewCall { contract_address, function_sig, args, accessor, return_fields, is_static })
+}
+
+/// Parses a function signature that may include "returns (type name, ...)".
+/// Returns (clean_sig, return_fields).
+fn parse_function_sig_with_returns(sig: &str) -> (String, Vec<ReturnField>) {
+    if let Some(returns_idx) = sig.to_lowercase().find(" returns ") {
+        let clean_sig = sig[..returns_idx].trim().to_string();
+        let returns_part = &sig[returns_idx + 9..].trim(); // skip " returns "
+        let return_fields = parse_return_fields(returns_part);
+        (clean_sig, return_fields)
+    } else {
+        (sig.to_string(), vec![])
+    }
+}
+
+/// Parses return fields from "(type name, type name, ...)" syntax.
+/// Supports nested tuples like "(uint256 x, uint256 y) coords".
+fn parse_return_fields(s: &str) -> Vec<ReturnField> {
+    let s = s.trim();
+    if !s.starts_with('(') || !s.ends_with(')') {
+        return vec![];
+    }
+
+    // Strip outer parens
+    let inner = &s[1..s.len() - 1];
+    parse_return_field_list(inner)
+}
+
+/// Parses a comma-separated list of return fields.
+fn parse_return_field_list(s: &str) -> Vec<ReturnField> {
+    let mut fields = Vec::new();
+    let mut current = String::new();
+    let mut paren_depth = 0;
+
+    for c in s.chars() {
+        match c {
+            '(' => {
+                paren_depth += 1;
+                current.push(c);
+            }
+            ')' => {
+                paren_depth -= 1;
+                current.push(c);
+            }
+            ',' if paren_depth == 0 => {
+                if let Some(field) = parse_single_return_field(current.trim()) {
+                    fields.push(field);
+                }
+                current.clear();
+            }
+            _ => current.push(c),
+        }
+    }
+
+    // Don't forget the last field
+    if !current.trim().is_empty() {
+        if let Some(field) = parse_single_return_field(current.trim()) {
+            fields.push(field);
+        }
+    }
+
+    fields
+}
+
+/// Parses a single return field like "uint256 amount" or "(uint256 x, uint256 y) coords".
+fn parse_single_return_field(s: &str) -> Option<ReturnField> {
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+
+    // Check for nested tuple: "(type name, ...) fieldName"
+    if s.starts_with('(') {
+        // Find matching closing paren
+        let mut paren_depth = 0;
+        let mut tuple_end = None;
+        for (i, c) in s.chars().enumerate() {
+            match c {
+                '(' => paren_depth += 1,
+                ')' => {
+                    paren_depth -= 1;
+                    if paren_depth == 0 {
+                        tuple_end = Some(i);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        if let Some(end) = tuple_end {
+            let tuple_part = &s[..=end];
+            let name = s[end + 1..].trim().to_string();
+            let children = parse_return_fields(tuple_part);
+            return Some(ReturnField { name, type_str: "tuple".to_string(), children });
+        }
+    }
+
+    // Simple field: "type name" or just "type" (unnamed)
+    let parts: Vec<&str> = s.split_whitespace().collect();
+    match parts.len() {
+        1 => Some(ReturnField {
+            name: String::new(), // Unnamed, must use position
+            type_str: parts[0].to_string(),
+            children: vec![],
+        }),
+        2 => Some(ReturnField {
+            name: parts[1].to_string(),
+            type_str: parts[0].to_string(),
+            children: vec![],
+        }),
+        _ => None,
+    }
+}
+
+/// Applies an accessor path to a DynSolValue.
+/// Supports: [0], .fieldName, and chains like [0].field.nested
+fn apply_accessor(
+    value: DynSolValue,
+    accessor: &str,
+    return_fields: &[ReturnField],
+) -> Option<DynSolValue> {
+    if accessor.is_empty() {
+        return Some(value);
+    }
+
+    let segments = parse_accessor_segments(accessor);
+    let mut current = value;
+    let mut current_fields = return_fields.to_vec();
+
+    for segment in segments {
+        match segment {
+            AccessorSegment::Index(idx) => {
+                // Array/tuple index access
+                current = match &current {
+                    DynSolValue::Tuple(items)
+                    | DynSolValue::Array(items)
+                    | DynSolValue::FixedArray(items) => items.get(idx)?.clone(),
+                    _ => return None,
+                };
+                // Update current_fields for nested access
+                if idx < current_fields.len() {
+                    current_fields = current_fields[idx].children.clone();
+                } else {
+                    current_fields = vec![];
+                }
+            }
+            AccessorSegment::Field(name) => {
+                // Named field access - look up position from return_fields
+                let (idx, field) =
+                    current_fields.iter().enumerate().find(|(_, f)| f.name == name)?;
+
+                current = match &current {
+                    DynSolValue::Tuple(items)
+                    | DynSolValue::Array(items)
+                    | DynSolValue::FixedArray(items) => items.get(idx)?.clone(),
+                    _ => return None,
+                };
+                current_fields = field.children.clone();
+            }
+        }
+    }
+
+    Some(current)
+}
+
+#[derive(Debug)]
+enum AccessorSegment {
+    Index(usize),
+    Field(String),
+}
+
+/// Parses accessor string into segments.
+/// "[0].field[1].nested" -> [Index(0), Field("field"), Index(1), Field("nested")]
+fn parse_accessor_segments(accessor: &str) -> Vec<AccessorSegment> {
+    let mut segments = Vec::new();
+    let mut remaining = accessor.trim();
+
+    while !remaining.is_empty() {
+        if remaining.starts_with('[') {
+            // Index access
+            if let Some(end) = remaining.find(']') {
+                if let Ok(idx) = remaining[1..end].parse::<usize>() {
+                    segments.push(AccessorSegment::Index(idx));
+                }
+                remaining = &remaining[end + 1..];
+            } else {
+                break;
+            }
+        } else if remaining.starts_with('.') {
+            // Field access
+            remaining = &remaining[1..]; // skip the dot
+                                         // Find end of field name (next . or [ or end)
+            let end = remaining.find(['.', '[']).unwrap_or(remaining.len());
+            let field_name = &remaining[..end];
+            if !field_name.is_empty() {
+                segments.push(AccessorSegment::Field(field_name.to_string()));
+            }
+            remaining = &remaining[end..];
+        } else {
+            // Unexpected character, stop parsing
+            break;
+        }
+    }
+
+    segments
+}
+
+/// Splits comma-separated arguments, respecting quoted strings.
+fn split_call_args(s: &str) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut current = String::new();
+    let mut in_quotes = false;
+    let mut paren_depth = 0;
+
+    for c in s.chars() {
+        match c {
+            '"' => {
+                in_quotes = !in_quotes;
+                current.push(c);
+            }
+            '(' => {
+                paren_depth += 1;
+                current.push(c);
+            }
+            ')' => {
+                paren_depth -= 1;
+                current.push(c);
+            }
+            ',' if !in_quotes && paren_depth == 0 => {
+                parts.push(std::mem::take(&mut current));
+            }
+            _ => current.push(c),
+        }
+    }
+    if !current.is_empty() {
+        parts.push(current);
+    }
+    parts
+}
+
+/// Executes a view call against the blockchain and applies any accessor.
+/// For static calls ($call_static), uses latest block and caches forever.
+/// For regular calls ($call), uses the event's block number and caches per-block.
+/// Note: Does NOT check is_running() - individual fallback calls should complete
+/// to avoid partial data. Shutdown is handled at the batch level.
+async fn execute_view_call(
+    view_call: &ViewCall,
+    log_params: &[LogParam],
+    tx_metadata: &TxMetadata,
+    provider: &JsonRpcCachedProvider,
+    network: &str,
+    constants: &Constants,
+) -> Option<DynSolValue> {
+    use alloy::primitives::keccak256;
+
+    // Resolve contract address - may be a constant, field reference, or literal
+    let contract_address: Address = if view_call.contract_address.starts_with("$constant(") {
+        // Resolve constant reference
+        let resolved = resolve_constants_in_value(&view_call.contract_address, constants, network)?;
+        resolved.parse().ok()?
+    } else if view_call.contract_address.starts_with('$') {
+        let field_name = &view_call.contract_address[1..];
+        if field_name == "rindexer_contract_address" {
+            tx_metadata.contract_address
+        } else {
+            let value = resolve_field_path(field_name, log_params)?;
+            match value {
+                DynSolValue::Address(addr) => addr,
+                _ => return None,
+            }
+        }
+    } else {
+        view_call.contract_address.parse().ok()?
+    };
+
+    // Parse function signature to get types
+    // e.g., "balanceOf(address)" -> selector + encode args
+    let (func_name, param_types) = parse_function_signature(&view_call.function_sig)?;
+
+    // Build function selector (first 4 bytes of keccak256 of signature)
+    let selector = &keccak256(view_call.function_sig.as_bytes())[..4];
+
+    // Encode arguments
+    let mut encoded_args = Vec::new();
+    for (i, arg_str) in view_call.args.iter().enumerate() {
+        let param_type = param_types.get(i)?;
+        let value =
+            resolve_arg_value(arg_str, log_params, tx_metadata, param_type, constants, network)?;
+        encoded_args.push(value);
+    }
+
+    // Build calldata: selector + encoded args
+    let calldata = if encoded_args.is_empty() {
+        Bytes::copy_from_slice(selector)
+    } else {
+        let encoded = DynSolValue::Tuple(encoded_args).abi_encode_params();
+        let mut data = selector.to_vec();
+        data.extend(encoded);
+        Bytes::from(data)
+    };
+
+    // For static calls, check the static cache first (no block number in key)
+    if view_call.is_static {
+        let static_cache_key = (network.to_string(), contract_address, calldata.clone());
+        {
+            let cache = STATIC_CALL_CACHE.read().await;
+            if let Some(cached) = cache.get(&static_cache_key) {
+                debug!("Static call cache hit for {}::{}", contract_address, func_name);
+                return apply_accessor_if_present(cached.clone(), view_call);
+            }
+        }
+
+        // Acquire semaphore permit
+        let semaphore = VIEW_CALL_SEMAPHORE.read().await.clone();
+        let _permit = semaphore.acquire().await.ok()?;
+
+        // Double-check cache after acquiring permit
+        {
+            let cache = STATIC_CALL_CACHE.read().await;
+            if let Some(cached) = cache.get(&static_cache_key) {
+                return apply_accessor_if_present(cached.clone(), view_call);
+            }
+        }
+
+        // Execute static call at latest block
+        let result_bytes: String =
+            match provider.eth_call_latest(contract_address, calldata.clone()).await {
+                Ok(r) => r,
+                Err(e) => {
+                    warn!("Static view call failed for {}::{}: {}", contract_address, func_name, e);
+                    return None;
+                }
+            };
+
+        let result_bytes = hex::decode(result_bytes.trim_start_matches("0x")).ok()?;
+        let decoded = decode_view_call_result(&result_bytes, view_call)?;
+
+        // Cache in static cache (forever)
+        {
+            let mut cache = STATIC_CALL_CACHE.write().await;
+            cache.insert(static_cache_key, decoded.clone());
+        }
+
+        return apply_accessor_if_present(decoded, view_call);
+    }
+
+    // Regular call - check block-specific cache
+    let cache_key =
+        (network.to_string(), contract_address, calldata.clone(), tx_metadata.block_number);
+    {
+        let cache = VIEW_CALL_CACHE.read().await;
+        if let Some(cached) = cache.get(&cache_key) {
+            debug!("View call cache hit for {}::{}", contract_address, func_name);
+            return apply_accessor_if_present(cached.clone(), view_call);
+        }
+    }
+
+    // Acquire semaphore permit to limit concurrent RPC calls
+    let semaphore = VIEW_CALL_SEMAPHORE.read().await.clone();
+    let _permit = semaphore.acquire().await.ok()?;
+
+    // Double-check cache after acquiring permit
+    {
+        let cache = VIEW_CALL_CACHE.read().await;
+        if let Some(cached) = cache.get(&cache_key) {
+            return apply_accessor_if_present(cached.clone(), view_call);
+        }
+    }
+
+    // Execute the call at the event's block number
+    let result_bytes: String =
+        match provider.eth_call(contract_address, calldata.clone(), tx_metadata.block_number).await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                warn!("View call failed for {}::{}: {}", contract_address, func_name, e);
+                return None;
+            }
+        };
+
+    let result_bytes = hex::decode(result_bytes.trim_start_matches("0x")).ok()?;
+    let decoded = decode_view_call_result(&result_bytes, view_call)?;
+
+    // Cache the full result (before accessor is applied)
+    {
+        let mut cache = VIEW_CALL_CACHE.write().await;
+        cache.insert(cache_key, decoded.clone());
+    }
+
+    // Evict old entries if cache is getting large (skip during shutdown)
+    if is_running() {
+        evict_old_view_call_cache_entries().await;
+    }
+
+    apply_accessor_if_present(decoded, view_call)
+}
+
+/// Decodes the raw bytes from a view call result.
+fn decode_view_call_result(result_bytes: &[u8], view_call: &ViewCall) -> Option<DynSolValue> {
+    if !view_call.return_fields.is_empty() {
+        let return_type = build_return_type_from_fields(&view_call.return_fields);
+        match return_type.abi_decode(result_bytes) {
+            Ok(decoded) => Some(decoded),
+            Err(_) => {
+                // Fallback for string type: some tokens (MKR) return bytes32 for symbol()/name()
+                if result_bytes.len() == 32 {
+                    try_bytes32_as_string(result_bytes).map(DynSolValue::String)
+                } else {
+                    None
+                }
+            }
+        }
+    } else {
+        // Auto-detect the return type from the raw bytes
+        try_decode_return_value(result_bytes)
+    }
+}
+
+/// Resolves all $call(...) patterns in an arithmetic expression, replacing them with their values.
+/// Returns the modified expression string with calls replaced by their numeric values.
+async fn resolve_calls_in_arithmetic_expression(
+    expression: &str,
+    log_params: &[LogParam],
+    tx_metadata: &TxMetadata,
+    provider: &JsonRpcCachedProvider,
+    network: &str,
+    constants: &Constants,
+) -> Option<String> {
+    let call_patterns = find_call_patterns(expression);
+    if call_patterns.is_empty() {
+        return Some(expression.to_string());
+    }
+
+    let mut result = expression.to_string();
+
+    // Process calls in reverse order so indices remain valid after replacements
+    for (start, end, call_expr) in call_patterns.into_iter().rev() {
+        // Parse and execute the view call
+        let view_call = parse_view_call(&call_expr)?;
+        let call_result =
+            execute_view_call(&view_call, log_params, tx_metadata, provider, network, constants)
+                .await?;
+
+        // Convert result to string for substitution
+        let value_str = match call_result {
+            DynSolValue::Uint(val, _) => val.to_string(),
+            DynSolValue::Int(val, _) => val.to_string(),
+            DynSolValue::Bool(b) => if b { "1" } else { "0" }.to_string(),
+            _ => {
+                tracing::warn!(
+                    "View call in arithmetic returned non-numeric value: {:?}",
+                    call_result
+                );
+                return None;
+            }
+        };
+
+        // Replace the call expression with the value
+        result.replace_range(start..end, &value_str);
+    }
+
+    Some(result)
+}
+
+/// Applies accessor to a view call result if one is specified.
+fn apply_accessor_if_present(value: DynSolValue, view_call: &ViewCall) -> Option<DynSolValue> {
+    match &view_call.accessor {
+        Some(accessor) => apply_accessor(value, accessor, &view_call.return_fields),
+        None => Some(value),
+    }
+}
+
+/// Builds a DynSolType from parsed return fields.
+/// This allows proper ABI decoding when "returns (...)" syntax is used.
+fn build_return_type_from_fields(fields: &[ReturnField]) -> DynSolType {
+    if fields.len() == 1 && fields[0].children.is_empty() {
+        // Single return value - parse type directly
+        fields[0].type_str.parse().unwrap_or(DynSolType::Uint(256))
+    } else {
+        // Multiple return values or nested tuple - build tuple type
+        let inner_types: Vec<DynSolType> = fields
+            .iter()
+            .map(|f| {
+                if !f.children.is_empty() {
+                    // Nested tuple
+                    build_return_type_from_fields(&f.children)
+                } else {
+                    f.type_str.parse().unwrap_or(DynSolType::Uint(256))
+                }
+            })
+            .collect();
+        DynSolType::Tuple(inner_types)
+    }
+}
+
+/// Parses a function signature like "balanceOf(address)" into (name, param_types).
+fn parse_function_signature(sig: &str) -> Option<(String, Vec<DynSolType>)> {
+    let open_paren = sig.find('(')?;
+    let close_paren = sig.rfind(')')?;
+
+    let name = sig[..open_paren].to_string();
+    let params_str = &sig[open_paren + 1..close_paren];
+
+    let param_types: Vec<DynSolType> = if params_str.is_empty() {
+        vec![]
+    } else {
+        params_str.split(',').filter_map(|p| p.trim().parse::<DynSolType>().ok()).collect()
+    };
+
+    Some((name, param_types))
+}
+
+/// Resolves an argument value from a string (literal, $field reference, or $constant).
+fn resolve_arg_value(
+    arg_str: &str,
+    log_params: &[LogParam],
+    tx_metadata: &TxMetadata,
+    expected_type: &DynSolType,
+    constants: &Constants,
+    network: &str,
+) -> Option<DynSolValue> {
+    let arg_str = arg_str.trim();
+
+    // Check for constant reference first
+    if is_constant_ref(arg_str) {
+        let resolved = resolve_constants_in_value(arg_str, constants, network)?;
+        return parse_literal_as_type(&resolved, expected_type);
+    }
+
+    if let Some(field_name) = arg_str.strip_prefix('$') {
+        // Check tx metadata (all prefixed with rindexer_)
+        match field_name {
+            "rindexer_contract_address" => {
+                return Some(DynSolValue::Address(tx_metadata.contract_address))
+            }
+            "rindexer_block_number" => {
+                return Some(DynSolValue::Uint(U256::from(tx_metadata.block_number), 256))
+            }
+            _ => {}
+        }
+
+        // Resolve from log params
+        resolve_field_path(field_name, log_params)
+    } else {
+        // Parse literal value based on expected type
+        parse_literal_as_type(arg_str, expected_type)
+    }
+}
+
+/// Parses a literal string as the expected DynSolType.
+fn parse_literal_as_type(value: &str, sol_type: &DynSolType) -> Option<DynSolValue> {
+    match sol_type {
+        DynSolType::Address => {
+            let addr: Address = value.parse().ok()?;
+            Some(DynSolValue::Address(addr))
+        }
+        DynSolType::Uint(bits) => {
+            let num: U256 = value.parse().ok()?;
+            Some(DynSolValue::Uint(num, *bits))
+        }
+        DynSolType::Bool => {
+            let b = value.to_lowercase() == "true" || value == "1";
+            Some(DynSolValue::Bool(b))
+        }
+        DynSolType::String => Some(DynSolValue::String(value.to_string())),
+        DynSolType::Bytes => {
+            let bytes = hex::decode(value.trim_start_matches("0x")).ok()?;
+            Some(DynSolValue::Bytes(bytes))
+        }
+        _ => None,
+    }
+}
+
+/// Try to decode return value bytes with intelligent type detection.
+/// Tries multiple ABI decodings and returns the first successful one.
+fn try_decode_return_value(bytes: &[u8]) -> Option<DynSolValue> {
+    // Empty or too short - can't decode
+    if bytes.is_empty() {
+        return None;
+    }
+
+    // Try to detect ABI-encoded string/bytes (dynamic types)
+    // Dynamic types have: [offset (32 bytes)][length (32 bytes)][data...]
+    // The offset for a single return value is typically 0x20 (32)
+    if bytes.len() >= 64 {
+        let offset = U256::from_be_slice(&bytes[0..32]);
+        if offset == U256::from(32) && bytes.len() >= 64 {
+            let length = U256::from_be_slice(&bytes[32..64]);
+            let length_usize = length.to::<usize>();
+
+            // Sanity check: length should be reasonable and data should exist
+            if length_usize < 10000 && bytes.len() >= 64 + length_usize {
+                // Try decoding as string
+                if let Ok(decoded) = DynSolType::String.abi_decode(bytes) {
+                    if let DynSolValue::String(s) = &decoded {
+                        // Validate it's actually valid UTF-8 text (not random bytes)
+                        if s.chars()
+                            .all(|c| c.is_ascii_graphic() || c.is_ascii_whitespace() || c == '/')
+                        {
+                            return Some(decoded);
+                        }
+                    }
+                }
+
+                // Try decoding as bytes
+                if let Ok(decoded) = DynSolType::Bytes.abi_decode(bytes) {
+                    return Some(decoded);
+                }
+            }
+        }
+    }
+
+    // Handle bytes32 as string fallback (for tokens like MKR that return bytes32 for symbol/name)
+    // bytes32 is encoded as exactly 32 bytes, right-padded with zeros
+    if bytes.len() == 32 {
+        if let Some(string_value) = try_bytes32_as_string(bytes) {
+            return Some(DynSolValue::String(string_value));
+        }
+    }
+
+    // Handle multi-slot returns (e.g., slot0() returns 7 values)
+    // When bytes are a multiple of 32 and contain more than one slot,
+    // decode as a tuple of uint256 values to support accessor like [1]
+    if bytes.len() > 32 && bytes.len().is_multiple_of(32) {
+        let num_slots = bytes.len() / 32;
+        let tuple_types: Vec<DynSolType> = vec![DynSolType::Uint(256); num_slots];
+        let tuple_type = DynSolType::Tuple(tuple_types);
+        if let Ok(decoded) = tuple_type.abi_decode(bytes) {
+            return Some(decoded);
+        }
+    }
+
+    // NOTE: We intentionally do NOT auto-detect addresses or bools here because:
+    // - Any uint256 value < 2^160 has 12+ leading zeros (same as address encoding)
+    // - Values 0 and 1 are common numeric returns (like balanceOf returning 0)
+    // - The caller's column_type will guide proper conversion in dyn_sol_value_to_wrapper
+    // - When column is bool, uint 0/1 will be converted appropriately
+
+    // Default: decode as uint256
+    DynSolType::Uint(256).abi_decode(bytes).ok()
+}
+
+/// Try to interpret bytes32 as a string.
+/// Some older tokens (like MKR) return bytes32 for symbol() and name() instead of string.
+/// The bytes are left-aligned and right-padded with zeros.
+fn try_bytes32_as_string(bytes: &[u8]) -> Option<String> {
+    if bytes.len() != 32 {
+        return None;
+    }
+
+    // Find the end of the string (first zero byte or end of array)
+    let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+    let trimmed = &bytes[..end];
+
+    // Try to convert to UTF-8 string
+    if let Ok(s) = String::from_utf8(trimmed.to_vec()) {
+        // Validate it looks like a reasonable string (letters, numbers, common symbols)
+        if !s.is_empty() && s.chars().all(|c| c.is_ascii_graphic() || c.is_ascii_whitespace()) {
+            return Some(s);
+        }
+    }
+
+    None
+}
+
+/// Async version of extract_value_from_event that supports view calls and constants.
+/// Falls back to sync extraction for non-view-call values.
+async fn extract_value_from_event_async(
+    value_ref: &str,
+    log_params: &[LogParam],
+    tx_metadata: &TxMetadata,
+    column_type: &ColumnType,
+    provider: Option<&JsonRpcCachedProvider>,
+    network: &str,
+    constants: &Constants,
+) -> Option<EthereumSqlTypeWrapper> {
+    // Check for explicit null value first
+    if value_ref == "$null" {
+        return Some(EthereumSqlTypeWrapper::Null);
+    }
+
+    // Check for conditional expression: $if(condition, trueValue, falseValue)
+    if is_conditional_value(value_ref) {
+        match parse_conditional_value(value_ref) {
+            Ok((condition, true_value, false_value)) => {
+                // Evaluate the condition against event data
+                let json_data = log_params_to_json(log_params);
+                match filter_by_expression(&condition, &json_data) {
+                    Ok(true) => {
+                        // Condition is true, evaluate true_value (async for potential $call)
+                        return Box::pin(extract_value_from_event_async(
+                            &true_value,
+                            log_params,
+                            tx_metadata,
+                            column_type,
+                            provider,
+                            network,
+                            constants,
+                        ))
+                        .await;
+                    }
+                    Ok(false) => {
+                        // Condition is false, evaluate false_value (async for potential $call)
+                        return Box::pin(extract_value_from_event_async(
+                            &false_value,
+                            log_params,
+                            tx_metadata,
+                            column_type,
+                            provider,
+                            network,
+                            constants,
+                        ))
+                        .await;
+                    }
+                    Err(e) => {
+                        debug!("$if condition evaluation failed: {}. Condition: {}", e, condition);
+                        return None;
+                    }
+                }
+            }
+            Err(e) => {
+                debug!("Failed to parse $if expression: {}. Expression: {}", e, value_ref);
+                return None;
+            }
+        }
+    }
+
+    // First resolve any constants in the value (handles $constant(...) anywhere in string)
+    let resolved_constants: String;
+    let after_constants = if value_ref.contains("$constant(") {
+        resolved_constants = resolve_all_constants_in_value(value_ref, constants, network)?;
+        resolved_constants.as_str()
+    } else {
+        value_ref
+    };
+
+    // Check for arithmetic expression with $call() patterns
+    // e.g., "$amount / (10 ^ $call($asset, \"decimals()\")) * $call($oracle, \"getAssetPrice(address)\", $asset)"
+    if is_arithmetic_expression(after_constants) && arithmetic_has_calls(after_constants) {
+        let provider = provider?;
+        // Resolve all $call() patterns first, then evaluate arithmetic
+        let resolved_expr = resolve_calls_in_arithmetic_expression(
+            after_constants,
+            log_params,
+            tx_metadata,
+            provider,
+            network,
+            constants,
+        )
+        .await?;
+
+        // Now evaluate the arithmetic with calls resolved to values
+        let json_data = log_params_to_json(log_params);
+        return match evaluate_arithmetic(&resolved_expr, &json_data) {
+            Ok(ComputedValue::U256(val)) => match column_type {
+                ColumnType::Uint64 => Some(EthereumSqlTypeWrapper::U64BigInt(val.to::<u64>())),
+                ColumnType::Uint128 => Some(EthereumSqlTypeWrapper::U256Numeric(val)),
+                _ => Some(EthereumSqlTypeWrapper::U256Numeric(val)),
+            },
+            Ok(ComputedValue::String(s)) => Some(EthereumSqlTypeWrapper::String(s)),
+            Err(e) => {
+                tracing::debug!(
+                    "Arithmetic expression with calls evaluation failed: {}. Expression: {}",
+                    e,
+                    resolved_expr
+                );
+                None
+            }
+        };
+    }
+
+    // Check for standalone view call (not in arithmetic)
+    if is_view_call(after_constants) {
+        let provider = provider?;
+        let view_call = parse_view_call(after_constants)?;
+        let result =
+            execute_view_call(&view_call, log_params, tx_metadata, provider, network, constants)
+                .await?;
+        return Some(dyn_sol_value_to_wrapper(&result, column_type));
+    }
+
+    // Fall back to sync extraction for everything else
+    extract_value_from_event(after_constants, log_params, tx_metadata, column_type)
+}
+
+/// Resolves a field path from event log parameters, supporting:
+/// - Simple field access: `from` -> find param named "from"
+/// - Nested tuple access: `data.amount` -> uses LogParam.get_param_value for named access
+/// - Array indexing: `ids[0]` -> find param "ids", access element 0
+/// - Combined paths: `data.ids[0]` -> get "data.ids" via nested access, then index
+/// - Post-array field access: `transfers[0].amount` -> array element then named field
+///
+/// Strategy:
+/// 1. Split the path at array indices: `transfers[0].amount` -> ["transfers", "[0]", "amount"]
+/// 2. Track both the value AND the ABI components as we traverse
+/// 3. For array access, components describe each element's structure
+/// 4. For named field access after arrays, use components to find tuple position
+fn resolve_field_path(field_path: &str, log_params: &[LogParam]) -> Option<DynSolValue> {
+    use alloy::json_abi::Param;
+
+    // Parse the path into segments, separating array indices
+    let segments = parse_path_segments(field_path);
+    if segments.is_empty() {
+        return None;
+    }
+
+    // First segment is the field path (may include dots for nested access)
+    let first_segment = &segments[0];
+    if first_segment.starts_with('[') {
+        // Can't start with an array index
+        return None;
+    }
+
+    // Track both the value and the ABI components for named field resolution
+    let (mut current_value, mut current_components): (DynSolValue, Vec<Param>) =
+        if first_segment.contains('.') {
+            // Nested path like "data.tokens" - need to traverse and get final components
+            let (root, rest) = first_segment.split_once('.')?;
+            let param = log_params.iter().find(|p| p.name == root)?;
+
+            // Traverse the nested path to get value and final components
+            let mut value = param.value.clone();
+            let mut components = param.components.clone();
+
+            for part in rest.split('.') {
+                let (idx, nested_param) =
+                    components.iter().enumerate().find(|(_, p)| p.name == part)?;
+
+                value = value.as_fixed_seq()?.get(idx)?.clone();
+                components = nested_param.components.clone();
+            }
+
+            (value, components)
+        } else {
+            // Simple field access
+            let param = log_params.iter().find(|p| p.name == *first_segment)?;
+            (param.value.clone(), param.components.clone())
+        };
+
+    // Process remaining segments (array indices and post-index field access)
+    for segment in &segments[1..] {
+        if segment.starts_with('[') && segment.ends_with(']') {
+            // Array index segment
+            let index_str = &segment[1..segment.len() - 1];
+            let index: usize = index_str.parse().ok()?;
+
+            current_value = match &current_value {
+                DynSolValue::Array(arr) | DynSolValue::FixedArray(arr) => arr.get(index)?.clone(),
+                _ => return None, // Not an array
+            };
+            // Components stay the same - they describe each element's structure
+        } else {
+            // Field name segment - could be after array index or nested access
+            // First try numeric index for raw tuple access
+            if let Ok(idx) = segment.parse::<usize>() {
+                current_value = match &current_value {
+                    DynSolValue::Tuple(items) => items.get(idx)?.clone(),
+                    _ => return None,
+                };
+                // Update components to the nested field's components
+                if let Some(nested) = current_components.get(idx) {
+                    current_components = nested.components.clone();
+                } else {
+                    current_components = vec![];
+                }
+            } else {
+                // Named field access - use components to find position
+                let (idx, nested_param) =
+                    current_components.iter().enumerate().find(|(_, p)| p.name == *segment)?;
+
+                current_value = match &current_value {
+                    DynSolValue::Tuple(items) => items.get(idx)?.clone(),
+                    _ => return None,
+                };
+                // Update components to the nested field's components
+                current_components = nested_param.components.clone();
+            }
+        }
+    }
+
+    Some(current_value)
+}
+
+/// Parses a field path into segments, grouping field paths together and separating array indices.
+/// Examples:
+///   "from" -> ["from"]
+///   "ids[0]" -> ["ids", "[0]"]
+///   "data.ids[0]" -> ["data.ids", "[0]"]
+///   "data[0]" -> ["data", "[0]"]
+///   "a[0][1]" -> ["a", "[0]", "[1]"]
+///   "data.nested.field" -> ["data.nested.field"]
+fn parse_path_segments(path: &str) -> Vec<String> {
+    let mut segments = Vec::new();
+    let mut current = String::new();
+    let mut chars = path.chars().peekable();
+
+    while let Some(c) = chars.next() {
+        match c {
+            '[' => {
+                if !current.is_empty() {
+                    segments.push(std::mem::take(&mut current));
+                }
+                // Collect the array index including brackets
+                current.push('[');
+                while let Some(&next_c) = chars.peek() {
+                    current.push(chars.next().unwrap());
+                    if next_c == ']' {
+                        break;
+                    }
+                }
+                segments.push(std::mem::take(&mut current));
+            }
+            '.' if segments.iter().any(|s| s.starts_with('[')) => {
+                // After an array index, dot separates new segments
+                // (but before array index, dots are part of nested path)
+                if !current.is_empty() {
+                    segments.push(std::mem::take(&mut current));
+                }
+            }
+            _ => {
+                current.push(c);
+            }
+        }
+    }
+
+    if !current.is_empty() {
+        segments.push(current);
+    }
+
+    segments
+}
+
+/// Extracts a value from event log parameters, transaction metadata, or returns a literal value.
+///
+/// Supported `$` references:
+/// - `$null` - Explicit SQL NULL value (for nullable columns)
+/// - `$block_number` - Block number (uint64)
+/// - `$block_timestamp` - Block timestamp as TIMESTAMPTZ (may be None if not available)
+/// - `$tx_hash` - Transaction hash (bytes32)
+/// - `$contract_address` - Contract address (address)
+/// - `$log_index` - Log index (uint256)
+/// - `$tx_index` - Transaction index (uint64)
+/// - `$<event_field>` - Any field from the event (e.g., `$from`, `$to`, `$value`)
+/// - `$field.nested` - Nested tuple/struct access (e.g., `$data.amount`)
+/// - `$field[0]` - Array indexing (e.g., `$ids[0]`, `$tokens[1]`)
+/// - `$field[0].nested` - Combined array and field access (e.g., `$transfers[0].amount`)
+///
+/// Also supports computed columns with arithmetic expressions:
+/// - `$value * 2` - Multiply event field by 2
+/// - `$amount + $fee` - Add two event fields
+/// - `$ratio / 100` - Divide event field by 100
+/// - `($a + $b) * $c` - Complex expressions with parentheses
+fn extract_value_from_event(
+    value_ref: &str,
+    log_params: &[LogParam],
+    tx_metadata: &TxMetadata,
+    column_type: &ColumnType,
+) -> Option<EthereumSqlTypeWrapper> {
+    // Check for explicit null value first
+    if value_ref == "$null" {
+        return Some(EthereumSqlTypeWrapper::Null);
+    }
+
+    // Check for conditional expression: $if(condition, trueValue, falseValue)
+    if is_conditional_value(value_ref) {
+        match parse_conditional_value(value_ref) {
+            Ok((condition, true_value, false_value)) => {
+                // Evaluate the condition against event data
+                let json_data = log_params_to_json(log_params);
+                match filter_by_expression(&condition, &json_data) {
+                    Ok(true) => {
+                        // Condition is true, evaluate true_value
+                        return extract_value_from_event(
+                            &true_value,
+                            log_params,
+                            tx_metadata,
+                            column_type,
+                        );
+                    }
+                    Ok(false) => {
+                        // Condition is false, evaluate false_value
+                        return extract_value_from_event(
+                            &false_value,
+                            log_params,
+                            tx_metadata,
+                            column_type,
+                        );
+                    }
+                    Err(e) => {
+                        debug!("$if condition evaluation failed: {}. Condition: {}", e, condition);
+                        return None;
+                    }
+                }
+            }
+            Err(e) => {
+                debug!("Failed to parse $if expression: {}. Expression: {}", e, value_ref);
+                return None;
+            }
+        }
+    }
+
+    // Check for arithmetic expression first (e.g., "$value * 2", "$amount + $fee")
+    if is_arithmetic_expression(value_ref) {
+        let json_data = log_params_to_json(log_params);
+        return match evaluate_arithmetic(value_ref, &json_data) {
+            Ok(ComputedValue::U256(val)) => {
+                // Convert based on column type
+                match column_type {
+                    ColumnType::Uint64 => Some(EthereumSqlTypeWrapper::U64BigInt(val.to::<u64>())),
+                    ColumnType::Uint128 => Some(EthereumSqlTypeWrapper::U256Numeric(val)),
+                    _ => Some(EthereumSqlTypeWrapper::U256Numeric(val)),
+                }
+            }
+            Ok(ComputedValue::String(s)) => Some(EthereumSqlTypeWrapper::String(s)),
+            Err(e) => {
+                debug!("Arithmetic expression evaluation failed: {}. Expression: {}", e, value_ref);
+                None
+            }
+        };
+    }
+
+    // Check for string template (e.g., "Pool: $token0/$token1", "$from-$to")
+    if is_string_template(value_ref) {
+        return expand_string_template(value_ref, log_params, tx_metadata)
+            .map(EthereumSqlTypeWrapper::String);
+    }
+
+    if let Some(field_name) = value_ref.strip_prefix('$') {
+        // Check for built-in transaction metadata fields first (all prefixed with rindexer_)
+        match field_name {
+            "rindexer_block_number" => {
+                // Use U64BigInt for proper BIGINT binary serialization
+                return Some(EthereumSqlTypeWrapper::U64BigInt(tx_metadata.block_number));
+            }
+            "rindexer_block_timestamp" => {
+                return tx_metadata.block_timestamp.and_then(|ts| {
+                    DateTime::from_timestamp(ts.to::<i64>(), 0)
+                        .map(|dt| EthereumSqlTypeWrapper::DateTime(dt.with_timezone(&Utc)))
+                });
+            }
+            "rindexer_tx_hash" => {
+                // Store as hex string in CHAR(66) column
+                return Some(EthereumSqlTypeWrapper::StringChar(format!(
+                    "{:?}",
+                    tx_metadata.tx_hash
+                )));
+            }
+            "rindexer_block_hash" => {
+                // Store as hex string in CHAR(66) column
+                return Some(EthereumSqlTypeWrapper::StringChar(format!(
+                    "{:?}",
+                    tx_metadata.block_hash
+                )));
+            }
+            "rindexer_contract_address" => {
+                return Some(EthereumSqlTypeWrapper::Address(tx_metadata.contract_address));
+            }
+            "rindexer_log_index" => {
+                return Some(EthereumSqlTypeWrapper::U256(tx_metadata.log_index));
+            }
+            "rindexer_tx_index" => {
+                // Use U64BigInt for proper BIGINT binary serialization
+                return Some(EthereumSqlTypeWrapper::U64BigInt(tx_metadata.tx_index));
+            }
+            _ => {}
+        }
+
+        // Handle nested tuple access (e.g., $value.amount.token) and array indexing (e.g., $ids[0])
+        // Split into root field and nested path
+        let value = resolve_field_path(field_name, log_params)?;
+
+        Some(dyn_sol_value_to_wrapper(&value, column_type))
+    } else {
+        // Literal value
+        Some(literal_to_wrapper(value_ref, column_type))
+    }
+}
+
+/// Converts a DynSolValue to the appropriate EthereumSqlTypeWrapper.
+/// Uses PostgreSQL-compatible types (U256Numeric for NUMERIC, U64BigInt for BIGINT).
+fn dyn_sol_value_to_wrapper(
+    value: &DynSolValue,
+    column_type: &ColumnType,
+) -> EthereumSqlTypeWrapper {
+    match (value, column_type) {
+        (DynSolValue::Address(addr), ColumnType::Address) => EthereumSqlTypeWrapper::Address(*addr),
+        (DynSolValue::Uint(val, _), ColumnType::Uint256) => {
+            // Use U256Numeric for NUMERIC columns in PostgreSQL
+            EthereumSqlTypeWrapper::U256Numeric(*val)
+        }
+        (DynSolValue::Uint(val, _), ColumnType::Uint64) => {
+            // Use U64BigInt for BIGINT columns in PostgreSQL
+            EthereumSqlTypeWrapper::U64BigInt(val.to::<u64>())
+        }
+        (DynSolValue::Int(val, _), ColumnType::Int256) => {
+            // Use I256Numeric for NUMERIC columns in PostgreSQL
+            EthereumSqlTypeWrapper::I256Numeric(*val)
+        }
+        (DynSolValue::Bool(b), ColumnType::Bool) => EthereumSqlTypeWrapper::Bool(*b),
+        // Uint to Bool conversion (for when view call returns 0/1 but column is bool)
+        (DynSolValue::Uint(val, _), ColumnType::Bool) => {
+            EthereumSqlTypeWrapper::Bool(!val.is_zero())
+        }
+        (DynSolValue::String(s), ColumnType::String) => {
+            // Sanitize string: remove null bytes which PostgreSQL doesn't accept in VARCHAR
+            let sanitized = s.replace('\0', "");
+            EthereumSqlTypeWrapper::String(sanitized)
+        }
+        (DynSolValue::FixedBytes(bytes, _), ColumnType::Bytes32) => {
+            if bytes.len() == 32 {
+                EthereumSqlTypeWrapper::B256(alloy::primitives::B256::from_slice(bytes.as_slice()))
+            } else {
+                EthereumSqlTypeWrapper::Bytes(alloy::primitives::Bytes::copy_from_slice(
+                    bytes.as_slice(),
+                ))
+            }
+        }
+        (DynSolValue::Uint(val, _), ColumnType::Timestamp) => {
+            // Convert Unix timestamp uint256 to DateTime
+            if let Some(dt) = DateTime::from_timestamp(val.to::<i64>(), 0) {
+                EthereumSqlTypeWrapper::DateTime(dt.with_timezone(&Utc))
+            } else {
+                EthereumSqlTypeWrapper::U256Numeric(*val)
+            }
+        }
+        // Array types - convert to VecAddress or serialize as JSON
+        (DynSolValue::Array(items), ColumnType::Array(inner_type)) => {
+            // Handle address arrays specially since we have VecAddress
+            if **inner_type == ColumnType::Address {
+                let addresses: Vec<Address> = items
+                    .iter()
+                    .filter_map(|item| {
+                        if let DynSolValue::Address(addr) = item {
+                            Some(*addr)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                EthereumSqlTypeWrapper::VecAddress(addresses)
+            } else {
+                // For other array types, serialize as JSON string
+                let json_array: Vec<String> =
+                    items.iter().map(|item| format!("{:?}", item)).collect();
+                EthereumSqlTypeWrapper::String(format!("{:?}", json_array))
+            }
+        }
+        // Small integer types - use proper wrapper for binary serialization
+        (DynSolValue::Uint(val, _), ColumnType::Uint8) => {
+            EthereumSqlTypeWrapper::U8(val.to::<u8>())
+        }
+        (DynSolValue::Uint(val, _), ColumnType::Uint16) => {
+            EthereumSqlTypeWrapper::U16(val.to::<u16>())
+        }
+        (DynSolValue::Uint(val, _), ColumnType::Uint32) => {
+            EthereumSqlTypeWrapper::U32(val.to::<u32>())
+        }
+        (DynSolValue::Int(val, _), ColumnType::Int8) => EthereumSqlTypeWrapper::I8(val.as_i8()),
+        (DynSolValue::Int(val, _), ColumnType::Int16) => EthereumSqlTypeWrapper::I16(val.as_i16()),
+        (DynSolValue::Int(val, _), ColumnType::Int32) => EthereumSqlTypeWrapper::I32(val.as_i32()),
+        (DynSolValue::Int(val, _), ColumnType::Int64) => EthereumSqlTypeWrapper::I64(val.as_i64()),
+        // Cross-type conversions: when auto-detected type differs from column type
+        // This happens because try_decode_return_value defaults to uint256 for unknown types
+        (DynSolValue::Uint(val, _), ColumnType::Int256) => {
+            // Reinterpret uint256 as int256 (same byte representation, different sign interpretation)
+            let i256 = alloy::primitives::I256::from_raw(*val);
+            EthereumSqlTypeWrapper::I256Numeric(i256)
+        }
+        (DynSolValue::Uint(val, _), ColumnType::Int128) => {
+            let i256 = alloy::primitives::I256::from_raw(*val);
+            EthereumSqlTypeWrapper::I256Numeric(i256)
+        }
+        (DynSolValue::Uint(val, _), ColumnType::Int64) => {
+            // For smaller signed types, convert via i256 to handle potential negative values
+            let i256 = alloy::primitives::I256::from_raw(*val);
+            EthereumSqlTypeWrapper::I64(i256.as_i64())
+        }
+        (DynSolValue::Uint(val, _), ColumnType::Int32) => {
+            let i256 = alloy::primitives::I256::from_raw(*val);
+            EthereumSqlTypeWrapper::I32(i256.as_i32())
+        }
+        (DynSolValue::Uint(val, _), ColumnType::Int16) => {
+            let i256 = alloy::primitives::I256::from_raw(*val);
+            EthereumSqlTypeWrapper::I16(i256.as_i16())
+        }
+        (DynSolValue::Uint(val, _), ColumnType::Int8) => {
+            let i256 = alloy::primitives::I256::from_raw(*val);
+            EthereumSqlTypeWrapper::I8(i256.as_i8())
+        }
+        // Address conversion: uint256 values can be converted to addresses (lower 20 bytes)
+        (DynSolValue::Uint(val, _), ColumnType::Address) => {
+            // Take lower 20 bytes of uint256 as address
+            let bytes: [u8; 32] = val.to_be_bytes();
+            let addr = Address::from_slice(&bytes[12..32]);
+            EthereumSqlTypeWrapper::Address(addr)
+        }
+        // Fallback conversions - use PostgreSQL-compatible types
+        (DynSolValue::Uint(val, _), _) => EthereumSqlTypeWrapper::U256Numeric(*val),
+        (DynSolValue::Int(val, _), _) => EthereumSqlTypeWrapper::I256Numeric(*val),
+        // Bool to numeric conversions (true=1, false=0)
+        (DynSolValue::Bool(b), ColumnType::Uint256 | ColumnType::Uint128) => {
+            EthereumSqlTypeWrapper::U256Numeric(if *b { U256::from(1) } else { U256::ZERO })
+        }
+        (DynSolValue::Bool(b), ColumnType::Uint64) => {
+            EthereumSqlTypeWrapper::U64BigInt(if *b { 1 } else { 0 })
+        }
+        (DynSolValue::Bool(b), ColumnType::Uint32) => {
+            EthereumSqlTypeWrapper::U32(if *b { 1 } else { 0 })
+        }
+        (DynSolValue::Bool(b), ColumnType::Uint16) => {
+            EthereumSqlTypeWrapper::U16(if *b { 1 } else { 0 })
+        }
+        (DynSolValue::Bool(b), ColumnType::Uint8) => {
+            EthereumSqlTypeWrapper::U8(if *b { 1 } else { 0 })
+        }
+        (DynSolValue::Bool(b), ColumnType::Int256 | ColumnType::Int128) => {
+            EthereumSqlTypeWrapper::I256Numeric(if *b {
+                alloy::primitives::I256::try_from(1).unwrap()
+            } else {
+                alloy::primitives::I256::ZERO
+            })
+        }
+        (DynSolValue::Bool(b), ColumnType::Int64) => {
+            EthereumSqlTypeWrapper::I64(if *b { 1 } else { 0 })
+        }
+        (DynSolValue::Bool(b), ColumnType::Int32) => {
+            EthereumSqlTypeWrapper::I32(if *b { 1 } else { 0 })
+        }
+        (DynSolValue::Bool(b), ColumnType::Int16) => {
+            EthereumSqlTypeWrapper::I16(if *b { 1 } else { 0 })
+        }
+        (DynSolValue::Bool(b), ColumnType::Int8) => {
+            EthereumSqlTypeWrapper::I8(if *b { 1 } else { 0 })
+        }
+        (DynSolValue::Address(addr), _) => EthereumSqlTypeWrapper::Address(*addr),
+        (DynSolValue::Bool(b), _) => EthereumSqlTypeWrapper::Bool(*b),
+        (DynSolValue::String(s), _) => EthereumSqlTypeWrapper::String(s.clone()),
+        _ => EthereumSqlTypeWrapper::String(format!("{:?}", value)),
+    }
+}
+
+/// Converts a literal string value to the appropriate EthereumSqlTypeWrapper.
+/// Uses PostgreSQL-compatible types (U256Numeric for NUMERIC, U64BigInt for BIGINT).
+fn literal_to_wrapper(value: &str, column_type: &ColumnType) -> EthereumSqlTypeWrapper {
+    match column_type {
+        ColumnType::String => EthereumSqlTypeWrapper::String(value.to_string()),
+        // 8-bit integers -> U8/I8 (serialized as INT2/SMALLINT)
+        ColumnType::Uint8 => {
+            if let Ok(num) = value.parse::<u8>() {
+                EthereumSqlTypeWrapper::U8(num)
+            } else {
+                EthereumSqlTypeWrapper::String(value.to_string())
+            }
+        }
+        // 16-bit integers -> U16/I16 (serialized as INT2/SMALLINT)
+        ColumnType::Uint16 => {
+            if let Ok(num) = value.parse::<u16>() {
+                EthereumSqlTypeWrapper::U16(num)
+            } else {
+                EthereumSqlTypeWrapper::String(value.to_string())
+            }
+        }
+        // 32-bit integers -> U32/I32 (serialized as INT4/INTEGER)
+        ColumnType::Uint32 => {
+            if let Ok(num) = value.parse::<u32>() {
+                EthereumSqlTypeWrapper::U32(num)
+            } else {
+                EthereumSqlTypeWrapper::String(value.to_string())
+            }
+        }
+        ColumnType::Uint64 => {
+            if let Ok(num) = value.parse::<u64>() {
+                EthereumSqlTypeWrapper::U64BigInt(num)
+            } else {
+                EthereumSqlTypeWrapper::String(value.to_string())
+            }
+        }
+        ColumnType::Uint128 | ColumnType::Uint256 => {
+            if let Ok(num) = value.parse::<alloy::primitives::U256>() {
+                EthereumSqlTypeWrapper::U256Numeric(num)
+            } else {
+                EthereumSqlTypeWrapper::String(value.to_string())
+            }
+        }
+        // Signed 8-bit integers -> I8 (serialized as INT2/SMALLINT)
+        ColumnType::Int8 => {
+            if let Ok(num) = value.parse::<i8>() {
+                EthereumSqlTypeWrapper::I8(num)
+            } else {
+                EthereumSqlTypeWrapper::String(value.to_string())
+            }
+        }
+        // Signed 16-bit integers -> I16 (serialized as INT2/SMALLINT)
+        ColumnType::Int16 => {
+            if let Ok(num) = value.parse::<i16>() {
+                EthereumSqlTypeWrapper::I16(num)
+            } else {
+                EthereumSqlTypeWrapper::String(value.to_string())
+            }
+        }
+        // Signed 32-bit integers -> I32 (serialized as INT4/INTEGER)
+        ColumnType::Int32 => {
+            if let Ok(num) = value.parse::<i32>() {
+                EthereumSqlTypeWrapper::I32(num)
+            } else {
+                EthereumSqlTypeWrapper::String(value.to_string())
+            }
+        }
+        ColumnType::Int64 => {
+            if let Ok(num) = value.parse::<i64>() {
+                EthereumSqlTypeWrapper::I64(num)
+            } else {
+                EthereumSqlTypeWrapper::String(value.to_string())
+            }
+        }
+        ColumnType::Int128 | ColumnType::Int256 => {
+            if let Ok(num) = value.parse::<alloy::primitives::I256>() {
+                EthereumSqlTypeWrapper::I256Numeric(num)
+            } else {
+                EthereumSqlTypeWrapper::String(value.to_string())
+            }
+        }
+        ColumnType::Bool => {
+            let b = value.to_lowercase() == "true" || value == "1";
+            EthereumSqlTypeWrapper::Bool(b)
+        }
+        ColumnType::Address => {
+            if let Ok(addr) = value.parse::<alloy::primitives::Address>() {
+                EthereumSqlTypeWrapper::Address(addr)
+            } else {
+                EthereumSqlTypeWrapper::String(value.to_string())
+            }
+        }
+        ColumnType::Bytes => {
+            if let Ok(bytes) = value.parse::<alloy::primitives::Bytes>() {
+                EthereumSqlTypeWrapper::Bytes(bytes)
+            } else {
+                EthereumSqlTypeWrapper::String(value.to_string())
+            }
+        }
+        ColumnType::Bytes32 => {
+            if let Ok(bytes) = value.parse::<alloy::primitives::B256>() {
+                EthereumSqlTypeWrapper::B256(bytes)
+            } else {
+                EthereumSqlTypeWrapper::String(value.to_string())
+            }
+        }
+        ColumnType::Timestamp => {
+            // Try parsing as Unix timestamp first, then as ISO 8601
+            if let Ok(ts) = value.parse::<i64>() {
+                if let Some(dt) = DateTime::from_timestamp(ts, 0) {
+                    EthereumSqlTypeWrapper::DateTime(dt.with_timezone(&Utc))
+                } else {
+                    EthereumSqlTypeWrapper::String(value.to_string())
+                }
+            } else if let Ok(dt) = value.parse::<DateTime<Utc>>() {
+                EthereumSqlTypeWrapper::DateTime(dt)
+            } else {
+                EthereumSqlTypeWrapper::String(value.to_string())
+            }
+        }
+        // Arrays from literals are stored as JSON strings
+        // (arrays from event data are handled in dyn_sol_value_to_wrapper)
+        ColumnType::Array(_) => EthereumSqlTypeWrapper::String(value.to_string()),
+    }
+}
+
+/// Converts log parameters to a JSON object for filter evaluation.
+fn log_params_to_json(log_params: &[LogParam]) -> Value {
+    let mut map = serde_json::Map::new();
+    for param in log_params {
+        let value = dyn_sol_value_to_json(&param.value);
+        map.insert(param.name.clone(), value);
+    }
+    Value::Object(map)
+}
+
+/// Converts a DynSolValue to a JSON Value for filter evaluation.
+fn dyn_sol_value_to_json(value: &DynSolValue) -> Value {
+    match value {
+        DynSolValue::Address(addr) => json!(format!("{:?}", addr)),
+        DynSolValue::Uint(val, _) => {
+            // For large values, use string to preserve precision
+            if *val > U256::from(u64::MAX) {
+                json!(val.to_string())
+            } else {
+                json!(val.to::<u64>())
+            }
+        }
+        DynSolValue::Int(val, _) => json!(val.to_string()),
+        DynSolValue::Bool(b) => json!(*b),
+        DynSolValue::String(s) => json!(s),
+        DynSolValue::Bytes(b) => json!(format!("0x{}", hex::encode(b))),
+        DynSolValue::FixedBytes(b, _) => json!(format!("0x{}", hex::encode(b))),
+        DynSolValue::Tuple(values) => {
+            // Convert tuple to object with index keys
+            let obj: serde_json::Map<String, Value> = values
+                .iter()
+                .enumerate()
+                .map(|(i, v)| (i.to_string(), dyn_sol_value_to_json(v)))
+                .collect();
+            Value::Object(obj)
+        }
+        DynSolValue::Array(values) => {
+            json!(values.iter().map(dyn_sol_value_to_json).collect::<Vec<_>>())
+        }
+        _ => json!(format!("{:?}", value)),
+    }
+}
+
+/// Evaluates a filter expression against log parameters.
+/// Uses the powerful filter module for complex expressions.
+fn evaluate_filter(filter_expr: &str, log_params: &[LogParam]) -> bool {
+    let json_data = log_params_to_json(log_params);
+    match filter_by_expression(filter_expr, &json_data) {
+        Ok(result) => result,
+        Err(e) => {
+            debug!("Filter evaluation failed: {}. Expression: {}", e, filter_expr);
+            // On filter error, default to not matching (skip this event)
+            false
+        }
+    }
+}
+
+/// Expands iterate bindings by extracting arrays and creating virtual log params for each element.
+///
+/// For example, with bindings `[$ids as id, $values as amount]` and arrays of length 3,
+/// this returns 3 sets of log_params, each with additional synthetic params for `id` and `amount`.
+///
+/// Returns None if:
+/// - Any binding references a non-existent field
+/// - Any binding references a non-array field
+/// - Parallel arrays have different lengths
+fn expand_iterate_bindings(
+    bindings: &[IterateBinding],
+    log_params: &[LogParam],
+) -> Option<Vec<Vec<LogParam>>> {
+    if bindings.is_empty() {
+        // No iteration - return the original params as a single iteration
+        return Some(vec![log_params.to_vec()]);
+    }
+
+    // Extract arrays for each binding
+    let mut arrays: Vec<(&IterateBinding, Vec<DynSolValue>)> = Vec::new();
+
+    for binding in bindings {
+        // Find the field in log_params (supports nested paths like "data.ids")
+        let value = if binding.array_field.contains('.') {
+            let (root, rest) = binding.array_field.split_once('.')?;
+            let param = log_params.iter().find(|p| p.name == root)?;
+            param.get_param_value(rest)?
+        } else {
+            let param = log_params.iter().find(|p| p.name == binding.array_field)?;
+            param.value.clone()
+        };
+
+        // Extract array elements
+        let elements = match value {
+            DynSolValue::Array(arr) | DynSolValue::FixedArray(arr) => arr,
+            _ => {
+                debug!("iterate binding '{}' references non-array field", binding.array_field);
+                return None;
+            }
+        };
+
+        arrays.push((binding, elements));
+    }
+
+    // Verify all arrays have the same length
+    if arrays.is_empty() {
+        return Some(vec![log_params.to_vec()]);
+    }
+
+    let expected_len = arrays[0].1.len();
+    for (binding, arr) in &arrays {
+        if arr.len() != expected_len {
+            debug!(
+                "iterate binding '{}' has length {} but expected {} (arrays must have equal length)",
+                binding.array_field,
+                arr.len(),
+                expected_len
+            );
+            return None;
+        }
+    }
+
+    // Generate expanded params for each index
+    let mut result: Vec<Vec<LogParam>> = Vec::with_capacity(expected_len);
+
+    for idx in 0..expected_len {
+        // Clone the original params
+        let mut expanded_params = log_params.to_vec();
+
+        // Add synthetic params for each binding
+        for (binding, arr) in &arrays {
+            let element_value = arr[idx].clone();
+            expanded_params.push(LogParam::new(binding.alias.clone(), element_value));
+        }
+
+        result.push(expanded_params);
+    }
+
+    Some(result)
+}
+
+/// Processes table operations for a batch of events.
+///
+/// # Arguments
+/// * `tables` - The table configurations
+/// * `event_name` - The name of the event being processed
+/// * `events_data` - Batch of events with (log_params, network, tx_metadata)
+/// * `postgres` - Optional PostgreSQL client
+/// * `clickhouse` - Optional ClickHouse client
+/// * `providers` - RPC providers for view calls (keyed by network name)
+/// * `constants` - User-defined constants from the manifest (can be network-scoped)
+/// * `multicall_addresses` - Custom Multicall3 addresses per network (None = use default address)
+/// * `checkpoint_config` - Optional config for checkpointing progress on shutdown
+#[allow(clippy::too_many_arguments)]
+pub async fn process_table_operations(
+    tables: &[TableRuntime],
+    event_name: &str,
+    events_data: &[(Vec<LogParam>, String, TxMetadata)], // (log_params, network, tx_metadata)
+    postgres: Option<Arc<PostgresClient>>,
+    clickhouse: Option<Arc<ClickhouseClient>>,
+    providers: Arc<std::collections::HashMap<String, Arc<crate::provider::JsonRpcCachedProvider>>>,
+    constants: &Constants,
+    multicall_addresses: &std::collections::HashMap<String, Option<String>>,
+    checkpoint_config: Option<&ProgressCheckpointConfig>,
+) -> Result<(), String> {
+    // Exit early if shutdown requested before we start - no progress to save
+    if !is_running() {
+        info!("Shutdown requested - skipping table processing");
+        return Err("Shutdown requested".to_string());
+    }
+
+    // Check if any table needs timestamps and prefetch them in batch
+    let any_table_needs_timestamp = tables
+        .iter()
+        .any(|t| t.table.timestamp && t.table.events.iter().any(|e| e.event == event_name));
+
+    if any_table_needs_timestamp {
+        prefetch_block_timestamps(events_data, &providers, true).await;
+    }
+
+    // Check if any table has $call or $call_static patterns and prefetch using Multicall3
+    let any_table_has_calls = tables.iter().any(|t| {
+        t.table.events.iter().any(|e| {
+            e.event == event_name
+                && e.operations.iter().any(|op| {
+                    let has_call = |v: &str| v.contains("$call(") || v.contains("$call_static(");
+                    op.where_clause.values().any(|v| has_call(v))
+                        || op.set.iter().any(|s| has_call(s.effective_value()))
+                })
+        })
+    });
+
+    if any_table_has_calls {
+        prefetch_view_calls(
+            tables,
+            event_name,
+            events_data,
+            &providers,
+            constants,
+            multicall_addresses,
+        )
+        .await;
+
+        // Check if shutdown happened during prefetch - no DB writes yet, nothing to checkpoint
+        if !is_running() {
+            info!("Shutdown during $call resolution - no data written, skipping checkpoint");
+            return Err("Shutdown requested".to_string());
+        }
+    } else if !events_data.is_empty() {
+        // No $call patterns - just log that we're processing tables (this is fast)
+        let mut events_per_network: HashMap<String, usize> = HashMap::new();
+        for (_, network, _) in events_data {
+            *events_per_network.entry(network.clone()).or_default() += 1;
+        }
+        for (network, count) in &events_per_network {
+            info!("{}::{} - {} events - resolving tables", event_name, network, count);
+        }
+    }
+
+    // Track the max block number written per network - used for checkpointing on shutdown
+    let mut max_block_written_per_network: HashMap<String, u64> = HashMap::new();
+
+    for table_runtime in tables {
+        // Check for shutdown before processing each table
+        if !is_running() {
+            // Only checkpoint if we've actually written data to the database
+            if !max_block_written_per_network.is_empty() {
+                if let Some(checkpoint) = checkpoint_config {
+                    for (network, max_block) in &max_block_written_per_network {
+                        info!(
+                            "Shutdown - checkpointing block {} for {} (last block written)",
+                            max_block, network
+                        );
+                        checkpoint.checkpoint(network, *max_block).await;
+                    }
+                }
+            } else {
+                info!(
+                    "Shutdown during table processing - no data written yet, skipping checkpoint"
+                );
+            }
+            return Err("Shutdown requested".to_string());
+        }
+
+        // Find operations for this event
+        let event_mapping = table_runtime.table.events.iter().find(|e| e.event == event_name);
+
+        let event_mapping = match event_mapping {
+            Some(em) => em,
+            None => continue,
+        };
+
+        for operation in &event_mapping.operations {
+            let mut rows_to_process: Vec<TableRowData> = Vec::new();
+            // Track max block per network for this batch of rows
+            let mut batch_max_blocks: HashMap<String, u64> = HashMap::new();
+
+            // Check if condition has @table references - push to SQL instead of Rust evaluation
+            let (should_filter_in_rust, sql_condition) =
+                if let Some(condition_expr) = operation.condition() {
+                    match parse_filter_expression(condition_expr) {
+                        Ok(expr) => {
+                            if expr.has_table_references() {
+                                let sql = expr.to_sql_condition(&table_runtime.full_table_name);
+                                (false, Some(sql))
+                            } else {
+                                (true, None)
+                            }
+                        }
+                        Err(e) => {
+                            debug!("Failed to parse condition for SQL generation: {}", e);
+                            (true, None)
+                        }
+                    }
+                } else {
+                    (false, None)
+                };
+
+            for (log_params, network, tx_metadata) in events_data {
+                // Check for shutdown before processing each event - exit quickly
+                if !is_running() {
+                    // Checkpoint what we've written so far
+                    if !max_block_written_per_network.is_empty() {
+                        if let Some(checkpoint) = checkpoint_config {
+                            for (net, max_block) in &max_block_written_per_network {
+                                info!(
+                                    "Shutdown - checkpointing block {} for {} (mid-batch)",
+                                    max_block, net
+                                );
+                                checkpoint.checkpoint(net, *max_block).await;
+                            }
+                        }
+                    }
+                    return Err("Shutdown requested".to_string());
+                }
+
+                // Expand iterate bindings - creates multiple virtual events from array fields
+                let expanded_params_list =
+                    match expand_iterate_bindings(&event_mapping.iterate, log_params) {
+                        Some(params) => params,
+                        None => {
+                            debug!("Failed to expand iterate bindings for event {}", event_name);
+                            continue;
+                        }
+                    };
+
+                for expanded_log_params in &expanded_params_list {
+                    if should_filter_in_rust {
+                        if let Some(condition_expr) = operation.condition() {
+                            if !evaluate_filter(condition_expr, expanded_log_params) {
+                                continue;
+                            }
+                        }
+                    }
+
+                    let mut columns: HashMap<String, EthereumSqlTypeWrapper> = HashMap::new();
+
+                    // Get provider for this network (for view calls)
+                    let provider = providers.get(network).map(|p| p.as_ref());
+
+                    // Add where clause columns
+                    for (column_name, value_ref) in &operation.where_clause {
+                        let column_def =
+                            table_runtime.table.columns.iter().find(|c| &c.name == column_name);
+
+                        if let Some(column_def) = column_def {
+                            if let Some(value) = extract_value_from_event_async(
+                                value_ref,
+                                expanded_log_params,
+                                tx_metadata,
+                                column_def.resolved_type(),
+                                provider,
+                                network,
+                                constants,
+                            )
+                            .await
+                            {
+                                columns.insert(column_name.clone(), value);
+                            }
+                        }
+                    }
+
+                    // Add set columns with their values
+                    for set_col in &operation.set {
+                        let column_def =
+                            table_runtime.table.columns.iter().find(|c| c.name == set_col.column);
+
+                        if let Some(column_def) = column_def {
+                            if let Some(value) = extract_value_from_event_async(
+                                set_col.effective_value(),
+                                expanded_log_params,
+                                tx_metadata,
+                                column_def.resolved_type(),
+                                provider,
+                                network,
+                                constants,
+                            )
+                            .await
+                            {
+                                columns.insert(set_col.column.clone(), value);
+                            }
+                        }
+                    }
+
+                    if !columns.is_empty() {
+                        // Auto-injected metadata columns
+                        let sequence_id = compute_sequence_id(
+                            tx_metadata.block_number,
+                            tx_metadata.tx_index,
+                            tx_metadata.log_index.to::<u64>(),
+                        );
+                        columns.insert(
+                            injected_columns::RINDEXER_SEQUENCE_ID.to_string(),
+                            EthereumSqlTypeWrapper::U128(sequence_id),
+                        );
+                        columns.insert(
+                            injected_columns::BLOCK_NUMBER.to_string(),
+                            EthereumSqlTypeWrapper::U64BigInt(tx_metadata.block_number),
+                        );
+                        // Only insert block_timestamp if table.timestamp is true
+                        if table_runtime.table.timestamp {
+                            let block_timestamp = if let Some(ts) = tx_metadata.block_timestamp {
+                                // Use timestamp from metadata if available
+                                Some(ts.to::<u64>())
+                            } else {
+                                // Look up from cache (prefetched at start of processing)
+                                get_cached_block_timestamp(network, tx_metadata.block_number).await
+                            };
+
+                            if let Some(ts) = block_timestamp {
+                                if let Some(dt) = DateTime::from_timestamp(ts as i64, 0) {
+                                    columns.insert(
+                                        injected_columns::BLOCK_TIMESTAMP.to_string(),
+                                        EthereumSqlTypeWrapper::DateTime(dt.with_timezone(&Utc)),
+                                    );
+                                }
+                            }
+                        }
+                        columns.insert(
+                            injected_columns::TX_HASH.to_string(),
+                            EthereumSqlTypeWrapper::StringChar(format!(
+                                "{:?}",
+                                tx_metadata.tx_hash
+                            )),
+                        );
+                        columns.insert(
+                            injected_columns::BLOCK_HASH.to_string(),
+                            EthereumSqlTypeWrapper::StringChar(format!(
+                                "{:?}",
+                                tx_metadata.block_hash
+                            )),
+                        );
+                        columns.insert(
+                            injected_columns::CONTRACT_ADDRESS.to_string(),
+                            EthereumSqlTypeWrapper::Address(tx_metadata.contract_address),
+                        );
+
+                        rows_to_process.push(TableRowData { columns, network: network.clone() });
+                        // Track max block for this batch
+                        batch_max_blocks
+                            .entry(network.clone())
+                            .and_modify(|max| {
+                                if tx_metadata.block_number > *max {
+                                    *max = tx_metadata.block_number;
+                                }
+                            })
+                            .or_insert(tx_metadata.block_number);
+                    }
+                } // end for expanded_log_params
+            }
+
+            if rows_to_process.is_empty() {
+                continue;
+            }
+
+            // Execute the operation
+            if let Some(postgres) = &postgres {
+                execute_postgres_operation(
+                    postgres,
+                    &table_runtime.full_table_name,
+                    &table_runtime.table,
+                    operation,
+                    &rows_to_process,
+                    sql_condition.as_deref(),
+                )
+                .await?;
+            }
+
+            if let Some(clickhouse) = &clickhouse {
+                execute_clickhouse_operation(
+                    clickhouse,
+                    &table_runtime.full_table_name,
+                    &table_runtime.table,
+                    operation,
+                    &rows_to_process,
+                )
+                .await?;
+            }
+
+            // DB write succeeded - update max blocks written tracker
+            for (network, block) in &batch_max_blocks {
+                max_block_written_per_network
+                    .entry(network.clone())
+                    .and_modify(|max| {
+                        if *block > *max {
+                            *max = *block;
+                        }
+                    })
+                    .or_insert(*block);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Maps ColumnType to BatchOperationSqlType.
+fn column_type_to_batch_sql_type(column_type: &ColumnType) -> BatchOperationSqlType {
+    match column_type {
+        ColumnType::Address => BatchOperationSqlType::Address,
+        // 8-bit and 16-bit integers -> SMALLINT (INT2)
+        ColumnType::Uint8 | ColumnType::Uint16 | ColumnType::Int8 | ColumnType::Int16 => {
+            BatchOperationSqlType::Smallint
+        }
+        // 32-bit integers -> INTEGER (INT4)
+        ColumnType::Uint32 | ColumnType::Int32 => BatchOperationSqlType::Integer,
+        // 64-bit integers
+        ColumnType::Uint64 | ColumnType::Int64 => BatchOperationSqlType::Bigint,
+        // Large integers -> NUMERIC
+        ColumnType::Uint128 | ColumnType::Uint256 | ColumnType::Int128 | ColumnType::Int256 => {
+            BatchOperationSqlType::Numeric
+        }
+        // Bytes types
+        ColumnType::Bytes | ColumnType::Bytes32 => BatchOperationSqlType::Bytea,
+        ColumnType::String => BatchOperationSqlType::Text,
+        ColumnType::Bool => BatchOperationSqlType::Bool,
+        ColumnType::Timestamp => BatchOperationSqlType::DateTime,
+        // All array types use TEXT[] for simplicity
+        ColumnType::Array(_) => BatchOperationSqlType::TextArray,
+    }
+}
+
+/// Maps SetAction to BatchOperationAction.
+fn set_action_to_batch_action(action: &SetAction) -> BatchOperationAction {
+    match action {
+        SetAction::Set => BatchOperationAction::Set,
+        SetAction::Add => BatchOperationAction::Add,
+        SetAction::Subtract => BatchOperationAction::Subtract,
+        SetAction::Max => BatchOperationAction::Max,
+        SetAction::Min => BatchOperationAction::Min,
+        // Increment/Decrement are syntactic sugar for Add/Subtract with value "1"
+        SetAction::Increment => BatchOperationAction::Add,
+        SetAction::Decrement => BatchOperationAction::Subtract,
+    }
+}
+
+/// Maps OperationType to BatchOperationType.
+fn operation_type_to_batch_type(op_type: &OperationType) -> BatchOperationType {
+    match op_type {
+        OperationType::Upsert => BatchOperationType::Upsert,
+        OperationType::Insert => BatchOperationType::Insert,
+        OperationType::Update => BatchOperationType::Update,
+        OperationType::Delete => BatchOperationType::Delete,
+    }
+}
+
+/// Executes a PostgreSQL operation for tables using the batch operations infrastructure.
+///
+/// # Arguments
+/// * `sql_where` - Optional SQL WHERE condition for upsert operations.
+///   Used when the `if`/`filter` condition contains `@table` references.
+///   E.g., conditions like `$value > @balance` become SQL `EXCLUDED.value > table.balance`.
+async fn execute_postgres_operation(
+    postgres: &PostgresClient,
+    table_name: &str,
+    table_def: &Table,
+    operation: &TableOperation,
+    rows: &[TableRowData],
+    sql_where: Option<&str>,
+) -> Result<(), String> {
+    if rows.is_empty() {
+        return Ok(());
+    }
+
+    // Build rows of DynamicColumnDefinition for the batch operation
+    let mut batch_rows: Vec<Vec<DynamicColumnDefinition>> = Vec::with_capacity(rows.len());
+
+    // For Insert operations, don't use Distinct behavior (no deduplication)
+    let is_insert = operation.operation_type == OperationType::Insert;
+
+    for row in rows {
+        let mut columns: Vec<DynamicColumnDefinition> = Vec::new();
+
+        if !table_def.cross_chain {
+            // For Insert, network is just a normal column (no dedup)
+            let network_behavior = if is_insert {
+                BatchOperationColumnBehavior::Normal
+            } else {
+                BatchOperationColumnBehavior::Distinct
+            };
+            columns.push(DynamicColumnDefinition::new(
+                "network".to_string(),
+                EthereumSqlTypeWrapper::String(row.network.clone()),
+                BatchOperationSqlType::Varchar,
+                network_behavior,
+                BatchOperationAction::Where,
+            ));
+        }
+
+        for column in &table_def.columns {
+            let column_type = column.resolved_type();
+            let value = if let Some(v) = row.columns.get(&column.name) {
+                v.clone()
+            } else if let Some(default) = &column.default {
+                literal_to_wrapper(default, column_type)
+            } else {
+                // No value and no default - use NULL
+                // This handles cases like failed view calls where we don't have a value
+                EthereumSqlTypeWrapper::Null
+            };
+
+            // Determine behavior - primary key columns come from where clauses
+            // For Insert, no columns should be Distinct (no deduplication)
+            let is_pk = table_def.is_primary_key_column(&column.name);
+            let behavior = if is_insert {
+                BatchOperationColumnBehavior::Normal
+            } else if is_pk {
+                BatchOperationColumnBehavior::Distinct
+            } else {
+                BatchOperationColumnBehavior::Normal
+            };
+
+            // Determine action
+            let action = if is_pk && !is_insert {
+                BatchOperationAction::Where
+            } else if let Some(set_col) = operation.set.iter().find(|s| s.column == column.name) {
+                set_action_to_batch_action(&set_col.action)
+            } else {
+                BatchOperationAction::Nothing
+            };
+
+            columns.push(DynamicColumnDefinition::new(
+                column.name.clone(),
+                value,
+                column_type_to_batch_sql_type(column_type),
+                behavior,
+                action,
+            ));
+        }
+
+        // Auto-injected metadata columns
+        if let Some(seq_id) = row.columns.get(injected_columns::RINDEXER_SEQUENCE_ID) {
+            columns.push(DynamicColumnDefinition::new(
+                injected_columns::RINDEXER_SEQUENCE_ID.to_string(),
+                seq_id.clone(),
+                BatchOperationSqlType::Numeric,
+                BatchOperationColumnBehavior::Sequence,
+                BatchOperationAction::Set,
+            ));
+        }
+        if let Some(block) = row.columns.get(injected_columns::BLOCK_NUMBER) {
+            columns.push(DynamicColumnDefinition::new(
+                injected_columns::BLOCK_NUMBER.to_string(),
+                block.clone(),
+                BatchOperationSqlType::Bigint,
+                BatchOperationColumnBehavior::Normal,
+                BatchOperationAction::Set,
+            ));
+        }
+        if let Some(ts) = row.columns.get(injected_columns::BLOCK_TIMESTAMP) {
+            columns.push(DynamicColumnDefinition::new(
+                injected_columns::BLOCK_TIMESTAMP.to_string(),
+                ts.clone(),
+                BatchOperationSqlType::DateTime,
+                BatchOperationColumnBehavior::Normal,
+                BatchOperationAction::Set,
+            ));
+        }
+        if let Some(hash) = row.columns.get(injected_columns::TX_HASH) {
+            columns.push(DynamicColumnDefinition::new(
+                injected_columns::TX_HASH.to_string(),
+                hash.clone(),
+                BatchOperationSqlType::Custom("CHAR(66)"),
+                BatchOperationColumnBehavior::Normal,
+                BatchOperationAction::Set,
+            ));
+        }
+        if let Some(hash) = row.columns.get(injected_columns::BLOCK_HASH) {
+            columns.push(DynamicColumnDefinition::new(
+                injected_columns::BLOCK_HASH.to_string(),
+                hash.clone(),
+                BatchOperationSqlType::Custom("CHAR(66)"),
+                BatchOperationColumnBehavior::Normal,
+                BatchOperationAction::Set,
+            ));
+        }
+        if let Some(addr) = row.columns.get(injected_columns::CONTRACT_ADDRESS) {
+            columns.push(DynamicColumnDefinition::new(
+                injected_columns::CONTRACT_ADDRESS.to_string(),
+                addr.clone(),
+                BatchOperationSqlType::Address,
+                BatchOperationColumnBehavior::Normal,
+                BatchOperationAction::Set,
+            ));
+        }
+
+        batch_rows.push(columns);
+    }
+
+    let op_type = operation_type_to_batch_type(&operation.operation_type);
+    // Extract short table name (after the schema prefix)
+    let short_table_name = table_name.split('.').next_back().unwrap_or(table_name);
+    let event_name = format!("Tables::{}", short_table_name);
+
+    execute_dynamic_batch_operation(
+        postgres,
+        table_name,
+        op_type,
+        batch_rows,
+        &event_name,
+        sql_where,
+    )
+    .await?;
+
+    let op_label = match operation.operation_type {
+        OperationType::Upsert => "UPSERT",
+        OperationType::Insert => "INSERT",
+        OperationType::Update => "UPDATE",
+        OperationType::Delete => "DELETE",
+    };
+
+    info!("Tables::{} - {} - {} rows", short_table_name, op_label, rows.len());
+
+    Ok(())
+}
+
+/// Executes a ClickHouse operation for tables using the batch operations infrastructure.
+async fn execute_clickhouse_operation(
+    clickhouse: &ClickhouseClient,
+    table_name: &str,
+    table_def: &Table,
+    operation: &TableOperation,
+    rows: &[TableRowData],
+) -> Result<(), String> {
+    if rows.is_empty() {
+        return Ok(());
+    }
+
+    let mut batch_rows: Vec<Vec<DynamicColumnDefinition>> = Vec::with_capacity(rows.len());
+
+    // For Insert operations, don't use Distinct behavior (no deduplication)
+    let is_insert = operation.operation_type == OperationType::Insert;
+
+    for row in rows {
+        let mut columns: Vec<DynamicColumnDefinition> = Vec::new();
+
+        if !table_def.cross_chain {
+            // For Insert, network is just a normal column (no dedup)
+            let network_behavior = if is_insert {
+                BatchOperationColumnBehavior::Normal
+            } else {
+                BatchOperationColumnBehavior::Distinct
+            };
+            columns.push(DynamicColumnDefinition::new(
+                "network".to_string(),
+                EthereumSqlTypeWrapper::String(row.network.clone()),
+                BatchOperationSqlType::Varchar,
+                network_behavior,
+                BatchOperationAction::Where,
+            ));
+        }
+
+        for column in &table_def.columns {
+            let column_type = column.resolved_type();
+            let value = if let Some(v) = row.columns.get(&column.name) {
+                v.clone()
+            } else if let Some(default) = &column.default {
+                literal_to_wrapper(default, column_type)
+            } else {
+                // No value and no default - use NULL
+                // This handles cases like failed view calls where we don't have a value
+                EthereumSqlTypeWrapper::Null
+            };
+
+            // Determine behavior - primary key columns come from where clauses
+            // For Insert, no columns should be Distinct (no deduplication)
+            let is_pk = table_def.is_primary_key_column(&column.name);
+            let behavior = if is_insert {
+                BatchOperationColumnBehavior::Normal
+            } else if is_pk {
+                BatchOperationColumnBehavior::Distinct
+            } else {
+                BatchOperationColumnBehavior::Normal
+            };
+
+            let action = if is_pk && !is_insert {
+                BatchOperationAction::Where
+            } else if let Some(set_col) = operation.set.iter().find(|s| s.column == column.name) {
+                set_action_to_batch_action(&set_col.action)
+            } else {
+                BatchOperationAction::Nothing
+            };
+
+            columns.push(DynamicColumnDefinition::new(
+                column.name.clone(),
+                value,
+                column_type_to_batch_sql_type(column_type),
+                behavior,
+                action,
+            ));
+        }
+
+        // Add auto-injected metadata columns
+
+        // rindexer_sequence_id - used for ordering
+        if let Some(seq_id) = row.columns.get(injected_columns::RINDEXER_SEQUENCE_ID) {
+            columns.push(DynamicColumnDefinition::new(
+                injected_columns::RINDEXER_SEQUENCE_ID.to_string(),
+                seq_id.clone(),
+                BatchOperationSqlType::Numeric,
+                BatchOperationColumnBehavior::Sequence,
+                BatchOperationAction::Set,
+            ));
+        }
+
+        // last_updated_block
+        if let Some(block) = row.columns.get(injected_columns::BLOCK_NUMBER) {
+            columns.push(DynamicColumnDefinition::new(
+                injected_columns::BLOCK_NUMBER.to_string(),
+                block.clone(),
+                BatchOperationSqlType::Bigint,
+                BatchOperationColumnBehavior::Normal,
+                BatchOperationAction::Set,
+            ));
+        }
+
+        // last_updated_at
+        if let Some(ts) = row.columns.get(injected_columns::BLOCK_TIMESTAMP) {
+            columns.push(DynamicColumnDefinition::new(
+                injected_columns::BLOCK_TIMESTAMP.to_string(),
+                ts.clone(),
+                BatchOperationSqlType::DateTime,
+                BatchOperationColumnBehavior::Normal,
+                BatchOperationAction::Set,
+            ));
+        }
+
+        // tx_hash
+        if let Some(hash) = row.columns.get(injected_columns::TX_HASH) {
+            columns.push(DynamicColumnDefinition::new(
+                injected_columns::TX_HASH.to_string(),
+                hash.clone(),
+                BatchOperationSqlType::Custom("CHAR(66)"),
+                BatchOperationColumnBehavior::Normal,
+                BatchOperationAction::Set,
+            ));
+        }
+
+        // block_hash
+        if let Some(hash) = row.columns.get(injected_columns::BLOCK_HASH) {
+            columns.push(DynamicColumnDefinition::new(
+                injected_columns::BLOCK_HASH.to_string(),
+                hash.clone(),
+                BatchOperationSqlType::Custom("CHAR(66)"),
+                BatchOperationColumnBehavior::Normal,
+                BatchOperationAction::Set,
+            ));
+        }
+
+        // contract_address
+        if let Some(addr) = row.columns.get(injected_columns::CONTRACT_ADDRESS) {
+            columns.push(DynamicColumnDefinition::new(
+                injected_columns::CONTRACT_ADDRESS.to_string(),
+                addr.clone(),
+                BatchOperationSqlType::Address,
+                BatchOperationColumnBehavior::Normal,
+                BatchOperationAction::Set,
+            ));
+        }
+
+        batch_rows.push(columns);
+    }
+
+    let op_type = operation_type_to_batch_type(&operation.operation_type);
+    // Extract short table name (after the schema prefix)
+    let short_table_name = table_name.split('.').next_back().unwrap_or(table_name);
+    let event_name = format!("Tables::{}", short_table_name);
+
+    execute_clickhouse_dynamic_batch_operation(
+        clickhouse,
+        table_name,
+        op_type,
+        batch_rows,
+        &event_name,
+    )
+    .await?;
+
+    let op_label = match operation.operation_type {
+        OperationType::Upsert => "UPSERT",
+        OperationType::Insert => "INSERT",
+        OperationType::Update => "UPDATE",
+        OperationType::Delete => "DELETE",
+    };
+
+    info!("Tables::{} - {} - {} rows", short_table_name, op_label, rows.len());
+
+    Ok(())
+}
+
+// =============================================================================
+// Public helper functions for cron scheduler
+// =============================================================================
+
+/// Internal PostgreSQL operation execution - used by cron scheduler.
+/// This is a public wrapper around `execute_postgres_operation`.
+pub async fn execute_postgres_operation_internal(
+    postgres: &PostgresClient,
+    table_name: &str,
+    table_def: &Table,
+    operation: &TableOperation,
+    rows: &[TableRowData],
+    sql_where: Option<&str>,
+) -> Result<(), String> {
+    execute_postgres_operation(postgres, table_name, table_def, operation, rows, sql_where).await
+}
+
+/// Internal ClickHouse operation execution - used by cron scheduler.
+/// This is a public wrapper around `execute_clickhouse_operation`.
+pub async fn execute_clickhouse_operation_internal(
+    clickhouse: &ClickhouseClient,
+    table_name: &str,
+    table_def: &Table,
+    operation: &TableOperation,
+    rows: &[TableRowData],
+) -> Result<(), String> {
+    execute_clickhouse_operation(clickhouse, table_name, table_def, operation, rows).await
+}
+
+/// Execute a view call for cron operations (no event data available).
+///
+/// This function parses and executes view calls like `$call($contract, "balanceOf(address)", "0x...")`.
+/// It's similar to `execute_view_call` but uses contract_address instead of event data.
+pub async fn execute_view_call_for_cron(
+    value_ref: &str,
+    tx_metadata: &TxMetadata,
+    contract_address: &Address,
+    column_type: &ColumnType,
+    provider: &JsonRpcCachedProvider,
+    network: &str,
+) -> Option<EthereumSqlTypeWrapper> {
+    // Parse the view call
+    let view_call = parse_view_call(value_ref)?;
+
+    // Execute the view call with empty log_params (cron has no event data)
+    // We need to modify arg resolution to handle $contract and other cron-specific values
+    let result = execute_view_call_for_cron_internal(
+        &view_call,
+        tx_metadata,
+        contract_address,
+        provider,
+        network,
+    )
+    .await?;
+
+    Some(dyn_sol_value_to_wrapper(&result, column_type))
+}
+
+/// Internal function to execute a view call for cron operations.
+/// Note: Does NOT check is_running() - individual calls should complete
+/// to avoid partial data. Shutdown is handled at higher levels.
+async fn execute_view_call_for_cron_internal(
+    view_call: &ViewCall,
+    tx_metadata: &TxMetadata,
+    contract_address: &Address,
+    provider: &JsonRpcCachedProvider,
+    network: &str,
+) -> Option<DynSolValue> {
+    use alloy::primitives::keccak256;
+
+    // Resolve contract address
+    let resolved_address: Address = if view_call.contract_address.starts_with('$') {
+        let field_name = &view_call.contract_address[1..];
+        match field_name {
+            "contract" | "rindexer_contract_address" => *contract_address,
+            _ => {
+                warn!("Unknown contract reference in cron view call: {}", field_name);
+                return None;
+            }
+        }
+    } else {
+        view_call.contract_address.parse().ok()?
+    };
+
+    // Parse function signature to get types
+    let (func_name, param_types) = parse_function_signature(&view_call.function_sig)?;
+
+    // Build function selector (first 4 bytes of keccak256 of signature)
+    let selector = &keccak256(view_call.function_sig.as_bytes())[..4];
+
+    // Encode arguments (for cron, we only support literals and $contract)
+    let mut encoded_args = Vec::new();
+    for (i, arg_str) in view_call.args.iter().enumerate() {
+        let param_type = param_types.get(i)?;
+        let value = resolve_cron_arg_value(arg_str.trim(), contract_address, param_type)?;
+        encoded_args.push(value);
+    }
+
+    // Build calldata: selector + encoded args
+    let calldata = if encoded_args.is_empty() {
+        Bytes::copy_from_slice(selector)
+    } else {
+        let encoded = DynSolValue::Tuple(encoded_args).abi_encode_params();
+        let mut data = selector.to_vec();
+        data.extend(encoded);
+        Bytes::from(data)
+    };
+
+    // Check cache first
+    let cache_key =
+        (network.to_string(), resolved_address, calldata.clone(), tx_metadata.block_number);
+    {
+        let cache = VIEW_CALL_CACHE.read().await;
+        if let Some(cached) = cache.get(&cache_key) {
+            debug!("View call cache hit for {}::{}", resolved_address, func_name);
+            return apply_accessor_if_present(cached.clone(), view_call);
+        }
+    }
+
+    // Acquire semaphore permit to limit concurrent RPC calls
+    let semaphore = VIEW_CALL_SEMAPHORE.read().await.clone();
+    let _permit = semaphore.acquire().await.ok()?;
+
+    // Double-check cache after acquiring permit
+    {
+        let cache = VIEW_CALL_CACHE.read().await;
+        if let Some(cached) = cache.get(&cache_key) {
+            return apply_accessor_if_present(cached.clone(), view_call);
+        }
+    }
+
+    // Execute the call
+    let result_bytes: String =
+        match provider.eth_call(resolved_address, calldata.clone(), tx_metadata.block_number).await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                warn!("View call failed for {}::{}: {}", resolved_address, func_name, e);
+                return None;
+            }
+        };
+
+    // Decode the result
+    let result_bytes = hex::decode(result_bytes.trim_start_matches("0x")).ok()?;
+
+    // Determine return type - use explicit return_fields if provided, otherwise auto-detect
+    let decoded = if !view_call.return_fields.is_empty() {
+        let return_type = build_return_type_from_fields(&view_call.return_fields);
+        match return_type.abi_decode(&result_bytes) {
+            Ok(decoded) => decoded,
+            Err(_) => {
+                // Fallback for string type: some tokens (MKR) return bytes32 for symbol()/name()
+                // Try to decode as bytes32 and convert to string
+                if result_bytes.len() == 32 {
+                    if let Some(s) = try_bytes32_as_string(&result_bytes) {
+                        DynSolValue::String(s)
+                    } else {
+                        return None;
+                    }
+                } else {
+                    return None;
+                }
+            }
+        }
+    } else {
+        // Auto-detect the return type from the raw bytes
+        try_decode_return_value(&result_bytes)?
+    };
+
+    // Cache the result
+    {
+        let mut cache = VIEW_CALL_CACHE.write().await;
+        cache.insert(cache_key, decoded.clone());
+    }
+
+    // Evict old entries if cache is getting large (skip during shutdown)
+    if is_running() {
+        evict_old_view_call_cache_entries().await;
+    }
+
+    apply_accessor_if_present(decoded, view_call)
+}
+
+/// Resolves an argument value for cron operations (no event data).
+/// Only supports literals and $contract.
+fn resolve_cron_arg_value(
+    arg_str: &str,
+    contract_address: &Address,
+    expected_type: &DynSolType,
+) -> Option<DynSolValue> {
+    if let Some(field_name) = arg_str.strip_prefix('$') {
+        match field_name {
+            "contract" | "rindexer_contract_address" => {
+                return Some(DynSolValue::Address(*contract_address));
+            }
+            _ => {
+                warn!("Unknown cron argument reference: {}", arg_str);
+                return None;
+            }
+        }
+    }
+
+    // Parse literal value
+    parse_literal_to_dyn_sol_value(arg_str, expected_type)
+}
+
+/// Parse a literal value to a DynSolValue based on expected type.
+fn parse_literal_to_dyn_sol_value(value: &str, expected_type: &DynSolType) -> Option<DynSolValue> {
+    match expected_type {
+        DynSolType::Address => {
+            let addr: Address = value.trim_matches('"').parse().ok()?;
+            Some(DynSolValue::Address(addr))
+        }
+        DynSolType::Uint(bits) => {
+            let num: U256 = value.parse().ok()?;
+            Some(DynSolValue::Uint(num, *bits))
+        }
+        DynSolType::Int(bits) => {
+            let num: alloy::primitives::I256 = value.parse().ok()?;
+            Some(DynSolValue::Int(num, *bits))
+        }
+        DynSolType::Bool => {
+            let b: bool = value.parse().ok()?;
+            Some(DynSolValue::Bool(b))
+        }
+        DynSolType::String => Some(DynSolValue::String(value.trim_matches('"').to_string())),
+        DynSolType::Bytes => {
+            let bytes = hex::decode(value.trim_start_matches("0x")).ok()?;
+            Some(DynSolValue::Bytes(bytes))
+        }
+        DynSolType::FixedBytes(size) => {
+            let bytes = hex::decode(value.trim_start_matches("0x")).ok()?;
+            if bytes.len() != *size {
+                return None;
+            }
+            Some(DynSolValue::FixedBytes(alloy::primitives::FixedBytes::from_slice(&bytes), *size))
+        }
+        _ => None,
+    }
+}
+
+/// Parse a literal value for a column type.
+/// This is used by the cron scheduler to convert literal values to EthereumSqlTypeWrapper.
+pub fn parse_literal_value_for_column(
+    value: &str,
+    column_type: &ColumnType,
+) -> Option<EthereumSqlTypeWrapper> {
+    Some(literal_to_wrapper(value, column_type))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_evaluate_filter_equals() {
+        let params = vec![LogParam::new(
+            "from".to_string(),
+            DynSolValue::Address(alloy::primitives::Address::ZERO),
+        )];
+
+        assert!(evaluate_filter("from == 0x0000000000000000000000000000000000000000", &params));
+        assert!(!evaluate_filter("from == 0x1111111111111111111111111111111111111111", &params));
+    }
+
+    #[test]
+    fn test_evaluate_filter_not_equals() {
+        let params = vec![LogParam::new(
+            "to".to_string(),
+            DynSolValue::Address(alloy::primitives::Address::ZERO),
+        )];
+
+        assert!(!evaluate_filter("to != 0x0000000000000000000000000000000000000000", &params));
+        assert!(evaluate_filter("to != 0x1111111111111111111111111111111111111111", &params));
+    }
+
+    #[test]
+    fn test_evaluate_filter_complex() {
+        let params = vec![
+            LogParam::new(
+                "from".to_string(),
+                DynSolValue::Address(alloy::primitives::Address::ZERO),
+            ),
+            LogParam::new("value".to_string(), DynSolValue::Uint(U256::from(1000u64), 256)),
+        ];
+
+        // Complex AND expression
+        assert!(evaluate_filter(
+            "from == 0x0000000000000000000000000000000000000000 && value > 500",
+            &params
+        ));
+        assert!(!evaluate_filter(
+            "from == 0x0000000000000000000000000000000000000000 && value > 2000",
+            &params
+        ));
+
+        // Complex OR expression
+        assert!(evaluate_filter(
+            "from != 0x0000000000000000000000000000000000000000 || value > 500",
+            &params
+        ));
+    }
+
+    #[test]
+    fn test_is_string_template() {
+        // Pure field references - NOT templates
+        assert!(!is_string_template("$from"));
+        assert!(!is_string_template("$data.amount"));
+        assert!(!is_string_template("$ids[0]"));
+        assert!(!is_string_template("$transfers[0].value"));
+        assert!(!is_string_template("global")); // No $ at all
+
+        // String templates - ARE templates
+        assert!(is_string_template("$from-$to"));
+        assert!(is_string_template("Pool: $token0/$token1"));
+        assert!(is_string_template("Transfer from $from"));
+        assert!(is_string_template("Value: $value"));
+        assert!(is_string_template("$from to $to"));
+    }
+
+    #[test]
+    fn test_expand_string_template() {
+        let params = vec![
+            LogParam::new(
+                "from".to_string(),
+                DynSolValue::Address("0x1111111111111111111111111111111111111111".parse().unwrap()),
+            ),
+            LogParam::new(
+                "to".to_string(),
+                DynSolValue::Address("0x2222222222222222222222222222222222222222".parse().unwrap()),
+            ),
+            LogParam::new("value".to_string(), DynSolValue::Uint(U256::from(1000u64), 256)),
+        ];
+
+        let tx_metadata = TxMetadata {
+            block_number: 12345,
+            block_timestamp: Some(U256::from(1700000000u64)),
+            tx_hash: B256::ZERO,
+            block_hash: B256::ZERO,
+            contract_address: Address::ZERO,
+            log_index: U256::from(0u64),
+            tx_index: 0,
+        };
+
+        // Simple concatenation
+        let result = expand_string_template("$from-$to", &params, &tx_metadata).unwrap();
+        assert_eq!(
+            result,
+            "0x1111111111111111111111111111111111111111-0x2222222222222222222222222222222222222222"
+        );
+
+        // With prefix text
+        let result = expand_string_template("Transfer: $value", &params, &tx_metadata).unwrap();
+        assert_eq!(result, "Transfer: 1000");
+
+        // Multiple fields with separators
+        let result = expand_string_template("$from -> $to: $value", &params, &tx_metadata).unwrap();
+        assert_eq!(
+            result,
+            "0x1111111111111111111111111111111111111111 -> 0x2222222222222222222222222222222222222222: 1000"
+        );
+
+        // With tx metadata (uses rindexer_ prefix)
+        let result =
+            expand_string_template("Block $rindexer_block_number", &params, &tx_metadata).unwrap();
+        assert_eq!(result, "Block 12345");
+
+        // Non-existent field returns None
+        let result = expand_string_template("$nonexistent", &params, &tx_metadata);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_resolve_field_path_post_array_access() {
+        use alloy::json_abi::Param;
+
+        // Create an array of transfer structs: [{from, to, amount}, {from, to, amount}]
+        let transfer1 = DynSolValue::Tuple(vec![
+            DynSolValue::Address("0x1111111111111111111111111111111111111111".parse().unwrap()),
+            DynSolValue::Address("0x2222222222222222222222222222222222222222".parse().unwrap()),
+            DynSolValue::Uint(U256::from(100u64), 256),
+        ]);
+        let transfer2 = DynSolValue::Tuple(vec![
+            DynSolValue::Address("0x3333333333333333333333333333333333333333".parse().unwrap()),
+            DynSolValue::Address("0x4444444444444444444444444444444444444444".parse().unwrap()),
+            DynSolValue::Uint(U256::from(200u64), 256),
+        ]);
+
+        // Create the array
+        let transfers_array = DynSolValue::Array(vec![transfer1, transfer2]);
+
+        // Create ABI components describing the struct fields
+        let components = vec![
+            Param {
+                name: "from".to_string(),
+                ty: "address".to_string(),
+                internal_type: None,
+                components: vec![],
+            },
+            Param {
+                name: "to".to_string(),
+                ty: "address".to_string(),
+                internal_type: None,
+                components: vec![],
+            },
+            Param {
+                name: "amount".to_string(),
+                ty: "uint256".to_string(),
+                internal_type: None,
+                components: vec![],
+            },
+        ];
+
+        // Create LogParam with components
+        let params =
+            vec![LogParam { name: "transfers".to_string(), value: transfers_array, components }];
+
+        // Test post-array field access: $transfers[0].amount
+        let result = resolve_field_path("transfers[0].amount", &params);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap(), DynSolValue::Uint(U256::from(100u64), 256));
+
+        // Test post-array field access: $transfers[1].from
+        let result = resolve_field_path("transfers[1].from", &params);
+        assert!(result.is_some());
+        assert_eq!(
+            result.unwrap(),
+            DynSolValue::Address("0x3333333333333333333333333333333333333333".parse().unwrap())
+        );
+
+        // Test post-array field access: $transfers[0].to
+        let result = resolve_field_path("transfers[0].to", &params);
+        assert!(result.is_some());
+        assert_eq!(
+            result.unwrap(),
+            DynSolValue::Address("0x2222222222222222222222222222222222222222".parse().unwrap())
+        );
+
+        // Test numeric index still works: $transfers[1].1 (second field = to)
+        let result = resolve_field_path("transfers[1].1", &params);
+        assert!(result.is_some());
+        assert_eq!(
+            result.unwrap(),
+            DynSolValue::Address("0x4444444444444444444444444444444444444444".parse().unwrap())
+        );
+
+        // Test non-existent field returns None
+        let result = resolve_field_path("transfers[0].nonexistent", &params);
+        assert!(result.is_none());
+
+        // Test out of bounds returns None
+        let result = resolve_field_path("transfers[5].amount", &params);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_is_view_call() {
+        // Valid view call expressions
+        assert!(is_view_call("$call(0x1234, \"balanceOf(address)\", $holder)"));
+        assert!(is_view_call("$call($contract_address, \"decimals()\")"));
+        assert!(is_view_call("$call($token, \"totalSupply()\")"));
+
+        // Not view calls
+        assert!(!is_view_call("$from"));
+        assert!(!is_view_call("$value"));
+        assert!(!is_view_call("call(something)"));
+        assert!(!is_view_call("$call("));
+        assert!(!is_view_call("$call"));
+    }
+
+    #[test]
+    fn test_parse_view_call() {
+        // Simple call with no args
+        let result = parse_view_call("$call(0x1234, \"decimals()\")");
+        assert!(result.is_some());
+        let vc = result.unwrap();
+        assert_eq!(vc.contract_address, "0x1234");
+        assert_eq!(vc.function_sig, "decimals()");
+        assert!(vc.args.is_empty());
+
+        // Call with one argument
+        let result = parse_view_call("$call($contract_address, \"balanceOf(address)\", $holder)");
+        assert!(result.is_some());
+        let vc = result.unwrap();
+        assert_eq!(vc.contract_address, "$contract_address");
+        assert_eq!(vc.function_sig, "balanceOf(address)");
+        assert_eq!(vc.args, vec!["$holder"]);
+
+        // Call with multiple arguments
+        let result =
+            parse_view_call("$call(0xABCD, \"allowance(address,address)\", $owner, $spender)");
+        assert!(result.is_some());
+        let vc = result.unwrap();
+        assert_eq!(vc.contract_address, "0xABCD");
+        assert_eq!(vc.function_sig, "allowance(address,address)");
+        assert_eq!(vc.args, vec!["$owner", "$spender"]);
+
+        // Invalid - missing signature
+        let result = parse_view_call("$call(0x1234)");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_split_call_args() {
+        // Simple arguments
+        let result = split_call_args("a, b, c");
+        assert_eq!(result, vec!["a", " b", " c"]);
+
+        // Quoted strings
+        let result = split_call_args("0x1234, \"balanceOf(address)\", $holder");
+        assert_eq!(result, vec!["0x1234", " \"balanceOf(address)\"", " $holder"]);
+
+        // Commas inside quotes
+        let result = split_call_args("$addr, \"transfer(address,uint256)\", $to, $amount");
+        assert_eq!(result, vec!["$addr", " \"transfer(address,uint256)\"", " $to", " $amount"]);
+
+        // Nested parentheses
+        let result = split_call_args("foo(1,2), bar");
+        assert_eq!(result, vec!["foo(1,2)", " bar"]);
+    }
+
+    #[test]
+    fn test_parse_function_signature() {
+        // No params
+        let result = parse_function_signature("decimals()");
+        assert!(result.is_some());
+        let (name, params) = result.unwrap();
+        assert_eq!(name, "decimals");
+        assert!(params.is_empty());
+
+        // Single param
+        let result = parse_function_signature("balanceOf(address)");
+        assert!(result.is_some());
+        let (name, params) = result.unwrap();
+        assert_eq!(name, "balanceOf");
+        assert_eq!(params.len(), 1);
+
+        // Multiple params
+        let result = parse_function_signature("transfer(address,uint256)");
+        assert!(result.is_some());
+        let (name, params) = result.unwrap();
+        assert_eq!(name, "transfer");
+        assert_eq!(params.len(), 2);
+
+        // Invalid - no parens
+        let result = parse_function_signature("invalid");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_try_decode_return_value() {
+        // Empty bytes returns None
+        assert!(try_decode_return_value(&[]).is_none());
+
+        // uint256 value (32 bytes, big-endian)
+        let mut uint_bytes = [0u8; 32];
+        uint_bytes[31] = 42; // value = 42
+        let result = try_decode_return_value(&uint_bytes);
+        assert!(result.is_some());
+        if let Some(DynSolValue::Uint(val, 256)) = result {
+            assert_eq!(val, alloy::primitives::U256::from(42));
+        } else {
+            panic!("Expected Uint(256)");
+        }
+
+        // ABI-encoded string "ETH"
+        // Format: [offset=32][length=3]["ETH" + padding]
+        let string_bytes = hex::decode(
+            "0000000000000000000000000000000000000000000000000000000000000020\
+             0000000000000000000000000000000000000000000000000000000000000003\
+             4554480000000000000000000000000000000000000000000000000000000000",
+        )
+        .unwrap();
+        let result = try_decode_return_value(&string_bytes);
+        assert!(result.is_some());
+        if let Some(DynSolValue::String(s)) = result {
+            assert_eq!(s, "ETH");
+        } else {
+            panic!("Expected String");
+        }
+    }
+}

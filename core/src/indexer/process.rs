@@ -13,6 +13,7 @@ use tracing::{debug, error, info};
 
 use crate::helpers::is_relevant_block;
 use crate::indexer::reorg::reorg_safe_distance_for_chain;
+use crate::metrics::indexing as metrics;
 use crate::provider::JsonRpcCachedProvider;
 use crate::{
     event::{
@@ -326,8 +327,15 @@ async fn live_indexing_for_contract_event_dependencies(
     let target_iteration_duration = Duration::from_millis(200);
     let callback_permits = Arc::new(Semaphore::new(1));
 
+    // Use the first event's cancel_token -- all events in this generation share the same token.
+    let generation_cancel = events.first().map(|(config, _)| config.cancel_token().clone());
+
     loop {
         if !is_running() {
+            break;
+        }
+        if generation_cancel.as_ref().is_some_and(|t| t.is_cancelled()) {
+            info!("Hot-reload: generation cancelled, stopping live indexing for {}", network);
             break;
         }
 
@@ -402,7 +410,7 @@ async fn live_indexing_for_contract_event_dependencies(
             // check reorg distance and skip if not safe
             if from_block > safe_block_number {
                 if reorg_safe_distance.is_zero() {
-                    let block_distance = latest_block_number - from_block;
+                    let block_distance = from_block - latest_block_number;
                     let is_outside_reorg_range =
                         block_distance > reorg_safe_distance_for_chain(cached_provider.chain.id());
 
@@ -597,9 +605,22 @@ async fn trigger_event(
 ) {
     indexing_event_processing();
 
+    // Record events processed metric
+    let event_count = fn_data.len() as u64;
+    if event_count > 0 {
+        metrics::record_events_indexed(
+            &config.network_contract().network,
+            &config.contract_name(),
+            &config.event_name(),
+            event_count,
+            to_block.to::<u64>(),
+            None, // Latest chain block updated elsewhere
+        );
+    }
+
     let should_update_progress = if fn_data.is_empty() {
         #[allow(clippy::needless_bool)]
-        if !is_running() {
+        if !is_running() || config.cancel_token().is_cancelled() {
             false
         } else {
             true

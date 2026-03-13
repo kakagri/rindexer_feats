@@ -9,10 +9,13 @@ use tokio::{
     task::{JoinError, JoinHandle},
     time::Instant,
 };
+use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 
 use crate::database::clickhouse::client::{ClickhouseClient, ClickhouseConnectionError};
 use crate::event::config::{ContractEventProcessingConfig, FactoryEventProcessingConfig};
+use crate::events::RindexerEventEmitter;
+use crate::helpers::format_duration;
 use crate::indexer::native_transfer::native_transfer_block_processor;
 use crate::indexer::Indexer;
 use crate::{
@@ -35,7 +38,7 @@ use crate::{
     },
     manifest::core::Manifest,
     provider::{JsonRpcCachedProvider, ProviderError},
-    PostgresClient,
+    PostgresClient, RindexerEvent,
 };
 
 #[derive(thiserror::Error, Debug)]
@@ -164,13 +167,14 @@ async fn get_start_end_block(
     Ok((start_block, end_block, indexing_distance_from_head))
 }
 
-pub async fn start_indexing_traces(
+async fn start_indexing_traces(
     manifest: &Manifest,
     project_path: &Path,
     postgres: Option<Arc<PostgresClient>>,
     clickhouse: Option<Arc<ClickhouseClient>>,
     indexer: &Indexer,
     trace_registry: Arc<TraceCallbackRegistry>,
+    cancel_token: CancellationToken,
 ) -> Result<Vec<JoinHandle<Result<(), ProcessEventError>>>, StartIndexingError> {
     if !manifest.native_transfers.enabled {
         info!("Native transfer indexing disabled!");
@@ -255,6 +259,7 @@ pub async fn start_indexing_traces(
             registry: network_registry,
             method: network_details.method,
             stream_last_synced_block_file_path: None,
+            cancel_token: cancel_token.clone(),
         });
 
         let block_fetch_handle = tokio::spawn(native_transfer_block_fetch(
@@ -264,6 +269,7 @@ pub async fn start_indexing_traces(
             network_details.end_block,
             indexing_distance_from_head,
             network_name.clone(),
+            cancel_token.clone(),
         ));
 
         non_blocking_process_events.push(block_fetch_handle);
@@ -281,7 +287,7 @@ pub async fn start_indexing_traces(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub async fn start_indexing_contract_events(
+async fn start_indexing_contract_events(
     manifest: &Manifest,
     project_path: &Path,
     postgres: Option<Arc<PostgresClient>>,
@@ -290,6 +296,7 @@ pub async fn start_indexing_contract_events(
     registry: Arc<EventCallbackRegistry>,
     dependencies: &[ContractEventDependencies],
     no_live_indexing_forced: bool,
+    cancel_token: CancellationToken,
 ) -> Result<
     (
         Vec<JoinHandle<Result<(), ProcessEventError>>>,
@@ -456,6 +463,7 @@ pub async fn start_indexing_contract_events(
                     },
                     index_event_in_order: event.index_event_in_order,
                     indexing_distance_from_head,
+                    cancel_token: cancel_token.clone(),
                 }
                 .into()
             }
@@ -488,6 +496,7 @@ pub async fn start_indexing_contract_events(
                 },
                 index_event_in_order: event.index_event_in_order,
                 indexing_distance_from_head,
+                cancel_token: cancel_token.clone(),
             }
             .into(),
         };
@@ -531,15 +540,72 @@ pub async fn start_indexing_contract_events(
     ))
 }
 
-pub async fn start_indexing(
+pub async fn start_historical_indexing(
+    manifest: &Manifest,
+    project_path: &Path,
+    dependencies: &[ContractEventDependencies],
+    registry: Arc<EventCallbackRegistry>,
+    trace_registry: Arc<TraceCallbackRegistry>,
+    event_emitter: Option<RindexerEventEmitter>,
+    cancel_token: CancellationToken,
+) -> Result<Vec<ProcessedNetworkContract>, StartIndexingError> {
+    info!("Historical indexing started");
+
+    let start = Instant::now();
+
+    let result = start_indexing(
+        manifest,
+        project_path,
+        dependencies,
+        true,
+        registry,
+        trace_registry,
+        cancel_token,
+    )
+    .await?;
+
+    let duration = start.elapsed();
+
+    info!("Historical indexing completed - time taken: {}", format_duration(duration));
+
+    if let Some(ref emitter) = event_emitter {
+        emitter.emit(RindexerEvent::HistoricalIndexingCompleted);
+    }
+
+    Ok(result)
+}
+
+pub async fn start_live_indexing(
+    manifest: &Manifest,
+    project_path: &Path,
+    dependencies: &[ContractEventDependencies],
+    registry: Arc<EventCallbackRegistry>,
+    trace_registry: Arc<TraceCallbackRegistry>,
+    cancel_token: CancellationToken,
+) -> Result<Vec<ProcessedNetworkContract>, StartIndexingError> {
+    info!("Live indexing started");
+
+    start_indexing(
+        manifest,
+        project_path,
+        dependencies,
+        false,
+        registry,
+        trace_registry,
+        cancel_token,
+    )
+    .await
+}
+
+async fn start_indexing(
     manifest: &Manifest,
     project_path: &Path,
     dependencies: &[ContractEventDependencies],
     no_live_indexing_forced: bool,
     registry: Arc<EventCallbackRegistry>,
     trace_registry: Arc<TraceCallbackRegistry>,
+    cancel_token: CancellationToken,
 ) -> Result<Vec<ProcessedNetworkContract>, StartIndexingError> {
-    let start = Instant::now();
     let database = initialize_database(manifest).await?;
     let clickhouse = initialize_clickhouse(manifest).await?;
 
@@ -556,7 +622,8 @@ pub async fn start_indexing(
             database.clone(),
             clickhouse.clone(),
             &indexer,
-            trace_registry.clone()
+            trace_registry.clone(),
+            cancel_token.clone(),
         ),
         start_indexing_contract_events(
             manifest,
@@ -567,6 +634,7 @@ pub async fn start_indexing(
             registry.clone(),
             dependencies,
             no_live_indexing_forced,
+            cancel_token.clone(),
         )
     );
 
@@ -621,10 +689,6 @@ pub async fn start_indexing(
             Err(e) => return Err(StartIndexingError::CombinedError(e)),
         }
     }
-
-    let duration = start.elapsed();
-
-    info!("Historical indexing complete - time taken: {:?}", duration);
 
     Ok(processed_network_contracts)
 }

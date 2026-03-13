@@ -29,6 +29,7 @@ use rindexer::{
     },
     write_file, StringOrArray, WriteFileError,
 };
+use std::collections::HashMap;
 
 #[cfg(not(feature = "reth"))]
 type RethConfig = ();
@@ -213,7 +214,13 @@ pub fn handle_new_command(
         description: project_description,
         repository,
         project_type,
-        config: Config { buffer: None, callback_concurrency: None, timestamp_sample_rate: None },
+        config: Config {
+            buffer: None,
+            callback_concurrency: None,
+            timestamp_sample_rate: None,
+            max_concurrent_view_calls: None,
+        },
+        constants: HashMap::new(),
         timestamps: None,
         networks: vec![Network {
             name: "ethereum".to_string(),
@@ -225,6 +232,7 @@ pub fn handle_new_command(
             disable_logs_bloom_checks: None,
             get_logs_settings: None,
             reth: final_reth_config,
+            multicall3_address: None,
         }],
         contracts: vec![Contract {
             name: "RocketPoolETH".to_string(),
@@ -250,6 +258,7 @@ pub fn handle_new_command(
             generate_csv: None,
             streams: None,
             chat: None,
+            tables: None,
         }],
         native_transfers: NativeTransfers::default(),
         phantom: None,

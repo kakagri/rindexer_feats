@@ -1,3 +1,4 @@
+use crate::adaptive_concurrency::ADAPTIVE_CONCURRENCY;
 use crate::notifications::ChainStateNotification;
 use alloy::network::{AnyNetwork, AnyRpcBlock, AnyTransactionReceipt};
 use alloy::rpc::types::{Filter, ValueOrArray};
@@ -46,6 +47,7 @@ use url::Url;
 use crate::helpers::chunk_hashset;
 use crate::layer_extensions::RpcLoggingLayer;
 use crate::manifest::network::{AddressFiltering, BlockPollFrequency};
+use crate::metrics::rpc as rpc_metrics;
 use crate::{event::RindexerEventFilter, manifest::core::Manifest};
 
 /// An alias type for a complex alloy Provider
@@ -219,12 +221,22 @@ impl JsonRpcCachedProvider {
             }
         }
 
-        let latest_block = self
+        let start = Instant::now();
+        let network = self.chain.to_string();
+
+        let result = self
             .provider
             .get_block(BlockId::Number(BlockNumberOrTag::Latest))
             .into_future()
             .instrument(debug_span!("fetching latest block", name = ?self.chain.named()))
-            .await?;
+            .await;
+
+        // Record RPC metrics for both success and failure (only when we actually call RPC, not from cache)
+        let duration = start.elapsed().as_secs_f64();
+        rpc_metrics::record_rpc_request(&network, "eth_getBlockByNumber", result.is_ok(), duration);
+
+        // Now propagate the error if any
+        let latest_block = result?;
 
         if let Some(block) = latest_block {
             let arc_block = Arc::new(block);
@@ -355,6 +367,64 @@ impl JsonRpcCachedProvider {
         Ok(traces)
     }
 
+    /// Makes an `eth_call` request at a specific block for view function calls.
+    ///
+    /// # Arguments
+    /// * `to` - The contract address to call
+    /// * `data` - The encoded calldata
+    /// * `block_number` - The block number at which to execute the call
+    ///
+    /// # Returns
+    /// The raw hex-encoded result bytes from the call
+    #[tracing::instrument(skip_all)]
+    pub async fn eth_call(
+        &self,
+        to: alloy::primitives::Address,
+        data: alloy::primitives::Bytes,
+        block_number: u64,
+    ) -> Result<String, ProviderError> {
+        let result: String = self
+            .provider
+            .raw_request(
+                "eth_call".into(),
+                (
+                    serde_json::json!({
+                        "to": format!("{:?}", to),
+                        "data": format!("0x{}", hex::encode(&data)),
+                    }),
+                    format!("0x{:x}", block_number),
+                ),
+            )
+            .await?;
+
+        Ok(result)
+    }
+
+    /// Executes eth_call at the "latest" block.
+    /// Use this for immutable data (symbol, decimals, name) that doesn't change.
+    #[tracing::instrument(skip_all)]
+    pub async fn eth_call_latest(
+        &self,
+        to: alloy::primitives::Address,
+        data: alloy::primitives::Bytes,
+    ) -> Result<String, ProviderError> {
+        let result: String = self
+            .provider
+            .raw_request(
+                "eth_call".into(),
+                (
+                    serde_json::json!({
+                        "to": format!("{:?}", to),
+                        "data": format!("0x{}", hex::encode(&data)),
+                    }),
+                    "latest",
+                ),
+            )
+            .await?;
+
+        Ok(result)
+    }
+
     /// Fetches blocks in concurrent rpc batches.
     #[tracing::instrument(skip_all, fields(len = block_numbers.len()))]
     pub async fn get_block_by_number_batch(
@@ -362,7 +432,21 @@ impl JsonRpcCachedProvider {
         block_numbers: &[U64],
         include_txs: bool,
     ) -> Result<Vec<AnyRpcBlock>, ProviderError> {
+        self.get_block_by_number_batch_with_size(block_numbers, include_txs, None).await
+    }
+
+    /// Fetch blocks by number in a batch RPC call with configurable batch size.
+    /// If `rpc_batch_size` is None, uses the adaptive batch size (auto-scales on rate limits).
+    pub async fn get_block_by_number_batch_with_size(
+        &self,
+        block_numbers: &[U64],
+        include_txs: bool,
+        rpc_batch_size: Option<usize>,
+    ) -> Result<Vec<AnyRpcBlock>, ProviderError> {
         let chain_id = self.chain.id();
+        // Use adaptive batch size (auto-scales down on rate limits for free nodes)
+        let batch_size =
+            rpc_batch_size.unwrap_or_else(|| ADAPTIVE_CONCURRENCY.current_batch_size());
 
         if block_numbers.is_empty() {
             return Ok(Vec::new());
@@ -375,7 +459,7 @@ impl JsonRpcCachedProvider {
         let semaphore = Arc::new(Semaphore::new(2));
 
         let futures = block_numbers
-            .chunks(RECOMMENDED_RPC_CHUNK_SIZE)
+            .chunks(batch_size)
             .map(|chunk| {
                 let client = self.client.clone();
                 let owned_chunk = chunk.to_vec();
@@ -402,17 +486,20 @@ impl JsonRpcCachedProvider {
                         return Err(e);
                     }
 
-                    try_join_all(request_futures).await
+                    // Use Option<AnyRpcBlock> to handle null responses (node doesn't have block)
+                    let results: Vec<Option<AnyRpcBlock>> = try_join_all(request_futures).await?;
+                    Ok(results)
                 })
             })
             .collect::<Vec<_>>();
 
-        let chunk_results: Vec<Result<Vec<AnyRpcBlock>, _>> = try_join_all(futures).await?;
+        let chunk_results: Vec<Result<Vec<Option<AnyRpcBlock>>, _>> = try_join_all(futures).await?;
         let results = chunk_results
             .into_iter()
             .collect::<Result<Vec<_>, _>>()?
             .into_iter()
             .flatten()
+            .flatten() // Filter out None values (blocks the node doesn't have)
             .collect();
 
         Ok(results)
@@ -428,8 +515,12 @@ impl JsonRpcCachedProvider {
             return Ok(Vec::new());
         }
 
+        // Use adaptive batch size (scales down on rate limits for free nodes)
+        // Cap at RPC_CHUNK_SIZE for efficiency on paid nodes
+        let batch_size =
+            std::cmp::min(RPC_CHUNK_SIZE, ADAPTIVE_CONCURRENCY.current_batch_size() * 10);
         let futures = hashes
-            .chunks(RPC_CHUNK_SIZE)
+            .chunks(batch_size)
             .map(|chunk| {
                 let client = self.client.clone();
                 let owned_chunk = chunk.to_vec();
@@ -476,6 +567,9 @@ impl JsonRpcCachedProvider {
         &self,
         event_filter: &RindexerEventFilter,
     ) -> Result<Vec<Log>, ProviderError> {
+        let start = Instant::now();
+        let network = self.chain.to_string();
+
         let addresses = event_filter.contract_addresses().await;
 
         let base_filter = Filter::new()
@@ -516,6 +610,10 @@ impl JsonRpcCachedProvider {
             },
             None => Ok(self.provider.get_logs(&base_filter).await?),
         };
+
+        // Record RPC metrics
+        let duration = start.elapsed().as_secs_f64();
+        rpc_metrics::record_rpc_request(&network, "eth_getLogs", logs.is_ok(), duration);
 
         logs
     }

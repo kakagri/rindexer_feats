@@ -1,4 +1,4 @@
-use std::str::FromStr;
+use std::{collections::HashMap, str::FromStr};
 
 use alloy::{primitives::U64, transports::http::reqwest::header::HeaderMap};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -23,6 +23,46 @@ use crate::{
         storage::Storage,
     },
 };
+
+/// A constant value that can be either a simple string or network-scoped.
+///
+/// # Examples
+///
+/// Simple constant (same value for all networks):
+/// ```yaml
+/// constants:
+///   my_address: "0x1234..."
+/// ```
+///
+/// Network-scoped constant (different value per network):
+/// ```yaml
+/// constants:
+///   oracle:
+///     ethereum: "0x1234..."
+///     polygon: "0x5678..."
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ConstantValue {
+    /// A simple string constant (same for all networks)
+    Simple(String),
+    /// A map of network name -> value (different per network)
+    NetworkScoped(HashMap<String, String>),
+}
+
+impl ConstantValue {
+    /// Resolve the constant value for a given network.
+    /// Returns the value if it's a simple constant, or looks up the network-specific value.
+    pub fn resolve(&self, network: &str) -> Option<&str> {
+        match self {
+            ConstantValue::Simple(value) => Some(value.as_str()),
+            ConstantValue::NetworkScoped(map) => map.get(network).map(|s| s.as_str()),
+        }
+    }
+}
+
+/// Type alias for the constants map
+pub type Constants = HashMap<String, ConstantValue>;
 
 fn deserialize_project_type<'de, D>(deserializer: D) -> Result<ProjectType, D::Error>
 where
@@ -77,6 +117,11 @@ pub struct Manifest {
 
     #[serde(default)]
     pub config: Config,
+
+    /// User-defined constants that can be referenced in table operations using `$constant(name)`.
+    /// Constants can be simple values or network-scoped (different value per network).
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub constants: Constants,
 
     #[serde(default)]
     pub timestamps: Option<bool>,
@@ -151,6 +196,34 @@ impl Manifest {
                         generate_csv: contract.generate_csv,
                         streams: None,
                         chat: None,
+                        tables: None,
+                    };
+
+                    // Get event names from include_events or tables before moving contract
+                    let fallback_events: Option<DependencyEventTreeYaml> = if contract.dependency_events.is_none() {
+                        let event_names: Vec<String> = if let Some(events) = &contract.include_events {
+                            events.iter().map(|e| e.name.clone()).collect()
+                        } else {
+                            // Fall back to events from tables
+                            let table_events = contract.get_table_event_names();
+                            if table_events.is_empty() {
+                                // Note: Even for cron-only tables, factory contracts require at least one event
+                                // because the dependency system uses events to coordinate indexing order.
+                                // Use `include_events` with any event from the contract's ABI.
+                                panic!("Contract using factory must specify `include_events` or `tables` with events. Even for cron-only tables, at least one event is required for the dependency system.");
+                            }
+                            table_events
+                        };
+
+                        Some(DependencyEventTreeYaml {
+                            events: event_names
+                                .into_iter()
+                                .map(SimpleEventOrContractEvent::SimpleEvent)
+                                .collect::<Vec<_>>(),
+                            then: None,
+                        })
+                    } else {
+                        None
                     };
 
                     let dependency_contract = Contract {
@@ -159,20 +232,7 @@ impl Manifest {
                                 contract_name: factory_contract.name.clone(),
                                 event_name: first_factory.event_name,
                             })],
-                            then: contract.dependency_events.or_else(|| {
-                                let events = contract
-                                    .include_events
-                                    .clone()
-                                    .expect("Contract using factory filter must specify `include_events`.");
-
-                                Some(DependencyEventTreeYaml {
-                                    events: events
-                                        .into_iter()
-                                        .map(|e|SimpleEventOrContractEvent::SimpleEvent(e.name))
-                                        .collect::<Vec<_>>(),
-                                    then: None,
-                                })
-                            }).map(Box::new),
+                            then: contract.dependency_events.or(fallback_events).map(Box::new),
                         }),
                         details: contract.details.into_iter().map(|detail| ContractDetails {
                             factory: Some(FactoryDetailsYaml {
@@ -200,11 +260,7 @@ impl Manifest {
     }
 
     pub fn has_any_contracts_live_indexing(&self) -> bool {
-        self.all_contracts()
-            .iter()
-            .filter(|c| c.details.iter().any(|p| p.end_block.is_none()))
-            .count()
-            > 0
+        self.all_contracts().iter().any(|c| c.details.iter().any(|p| p.end_block.is_none()))
     }
 
     /// Check if the manifest has opted-in to indexing native transfers. It is off by default.

@@ -55,6 +55,7 @@ async fn main() {
                     Some(IndexingDetails {
                         registry: register_all_handlers(&manifest_path).await,
                         trace_registry: TraceCallbackRegistry { events: vec![] },
+                        event_stream: None,
                     })
                 } else {
                     None
@@ -63,6 +64,8 @@ async fn main() {
                     enabled: enable_graphql,
                     override_port: graphql_port,
                 },
+                cron_scheduler_handle: None,
+                watch: false,
             })
             .await;
 

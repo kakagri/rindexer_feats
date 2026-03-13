@@ -1,0 +1,184 @@
+// Types are used by exported macros, not internally
+#![allow(dead_code)]
+use crate::EthereumSqlTypeWrapper;
+use tokio_postgres::types::Type as PgType;
+
+/// The type of batch operation to perform.
+#[derive(Clone, Copy)]
+pub enum BatchOperationType {
+    Update,
+    Delete,
+    Upsert,
+    /// Plain insert without conflict handling (for time-series/history data)
+    Insert,
+}
+
+/// Column behavior determines how columns are used in deduplication and ordering.
+#[derive(Clone, Copy)]
+pub enum BatchOperationColumnBehavior {
+    /// Normal column with no special behavior
+    Normal,
+    /// Column used for deduplication (DISTINCT ON in Postgres, part of ORDER BY in ClickHouse)
+    Distinct,
+    /// Column used for ordering/sequencing (determines which row to keep when deduplicating)
+    Sequence,
+}
+
+/// SQL type mapping for batch operations.
+#[derive(Clone, Copy)]
+pub enum BatchOperationSqlType {
+    Bytea,
+    Numeric,
+    Bool,
+    Jsonb,
+    Text,
+    Varchar,
+    /// Ethereum address - CHAR(42) in Postgres, String in ClickHouse
+    Address,
+    Smallint,
+    Integer,
+    Bigint,
+    DateTime,
+    TextArray,
+    Custom(&'static str),
+}
+
+impl BatchOperationSqlType {
+    /// Returns the PostgreSQL type string representation.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            BatchOperationSqlType::Bytea => "BYTEA",
+            BatchOperationSqlType::Numeric => "NUMERIC",
+            BatchOperationSqlType::Bool => "BOOL",
+            BatchOperationSqlType::Jsonb => "JSONB",
+            BatchOperationSqlType::Text => "TEXT",
+            BatchOperationSqlType::Varchar => "VARCHAR",
+            BatchOperationSqlType::Address => "CHAR(42)",
+            BatchOperationSqlType::Smallint => "SMALLINT",
+            BatchOperationSqlType::Integer => "INTEGER",
+            BatchOperationSqlType::Bigint => "BIGINT",
+            BatchOperationSqlType::DateTime => "TIMESTAMPTZ",
+            BatchOperationSqlType::TextArray => "TEXT[]",
+            BatchOperationSqlType::Custom(type_name) => type_name,
+        }
+    }
+
+    /// Returns the ClickHouse type string representation.
+    pub fn as_clickhouse_str(&self) -> &'static str {
+        match self {
+            BatchOperationSqlType::Bytea => "String",
+            BatchOperationSqlType::Numeric => "String",
+            BatchOperationSqlType::Bool => "Bool",
+            BatchOperationSqlType::Jsonb => "String",
+            BatchOperationSqlType::Text => "String",
+            BatchOperationSqlType::Varchar => "String",
+            BatchOperationSqlType::Address => "String",
+            BatchOperationSqlType::Smallint => "Int16",
+            BatchOperationSqlType::Integer => "Int32",
+            BatchOperationSqlType::Bigint => "Int64",
+            BatchOperationSqlType::DateTime => "DateTime('UTC')",
+            BatchOperationSqlType::TextArray => "Array(String)",
+            BatchOperationSqlType::Custom(type_name) => type_name,
+        }
+    }
+
+    /// Returns the PostgreSQL type for binary COPY operations.
+    pub fn to_pg_type(self) -> PgType {
+        match self {
+            BatchOperationSqlType::Bytea => PgType::BYTEA,
+            BatchOperationSqlType::Numeric => PgType::NUMERIC,
+            BatchOperationSqlType::Bool => PgType::BOOL,
+            BatchOperationSqlType::Jsonb => PgType::JSONB,
+            BatchOperationSqlType::Text => PgType::TEXT,
+            BatchOperationSqlType::Varchar => PgType::VARCHAR,
+            BatchOperationSqlType::Address => PgType::BPCHAR,
+            BatchOperationSqlType::Smallint => PgType::INT2,
+            BatchOperationSqlType::Integer => PgType::INT4,
+            BatchOperationSqlType::Bigint => PgType::INT8,
+            BatchOperationSqlType::DateTime => PgType::TIMESTAMPTZ,
+            BatchOperationSqlType::TextArray => PgType::TEXT_ARRAY,
+            // For custom types, default to TEXT - the value's to_type() will be used
+            BatchOperationSqlType::Custom(_) => PgType::TEXT,
+        }
+    }
+}
+
+/// Action to perform on a column during batch operations.
+#[derive(Clone, Copy)]
+pub enum BatchOperationAction {
+    /// No action (column is included but not updated)
+    Nothing,
+    /// Set the column to the new value
+    Set,
+    /// Use column in WHERE clause for matching
+    Where,
+    /// Add the new value to the existing value
+    Add,
+    /// Subtract the new value from the existing value
+    Subtract,
+    /// Keep the maximum (higher) value
+    Max,
+    /// Keep the minimum (lower) value
+    Min,
+}
+
+/// Definition of a column for batch operations.
+pub struct ColumnDefinition {
+    pub name: &'static str,
+    pub table_column: Option<&'static str>,
+    pub value: EthereumSqlTypeWrapper,
+    pub sql_type: BatchOperationSqlType,
+    pub behavior: BatchOperationColumnBehavior,
+    pub action: BatchOperationAction,
+}
+
+/// Creates a column definition for batch operations.
+pub fn column(
+    name: &'static str,
+    value: EthereumSqlTypeWrapper,
+    sql_type: BatchOperationSqlType,
+    behavior: BatchOperationColumnBehavior,
+    action: BatchOperationAction,
+) -> ColumnDefinition {
+    ColumnDefinition { name, table_column: None, value, sql_type, behavior, action }
+}
+
+/// Creates a column definition with a separate table column name.
+#[allow(clippy::too_many_arguments)]
+pub fn column_with_table_name(
+    name: &'static str,
+    table_column: &'static str,
+    value: EthereumSqlTypeWrapper,
+    sql_type: BatchOperationSqlType,
+    behavior: BatchOperationColumnBehavior,
+    action: BatchOperationAction,
+) -> ColumnDefinition {
+    ColumnDefinition { name, table_column: Some(table_column), value, sql_type, behavior, action }
+}
+
+/// Reserved SQL keywords that need quoting.
+pub const RESERVED_KEYWORDS: &[&str] =
+    &["group", "user", "order", "table", "index", "primary", "key"];
+
+/// Dynamic column definition for runtime batch operations (used by custom indexing).
+#[derive(Clone)]
+pub struct DynamicColumnDefinition {
+    pub name: String,
+    pub table_column: Option<String>,
+    pub value: EthereumSqlTypeWrapper,
+    pub sql_type: BatchOperationSqlType,
+    pub behavior: BatchOperationColumnBehavior,
+    pub action: BatchOperationAction,
+}
+
+impl DynamicColumnDefinition {
+    pub fn new(
+        name: String,
+        value: EthereumSqlTypeWrapper,
+        sql_type: BatchOperationSqlType,
+        behavior: BatchOperationColumnBehavior,
+        action: BatchOperationAction,
+    ) -> Self {
+        Self { name, table_column: None, value, sql_type, behavior, action }
+    }
+}

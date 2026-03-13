@@ -18,6 +18,7 @@ use std::num::NonZeroUsize;
 use std::{error::Error, str::FromStr, sync::Arc, time::Duration};
 use tokio::{sync::mpsc, time::Instant};
 use tokio_stream::wrappers::ReceiverStream;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 pub struct FetchLogsResult {
@@ -54,6 +55,7 @@ pub fn fetch_logs_stream(
         let original_max_limit = config.network_contract().cached_provider.max_block_range;
         let mut max_block_range_limitation =
             config.network_contract().cached_provider.max_block_range;
+        #[allow(clippy::unnecessary_unwrap)]
         if max_block_range_limitation.is_some() {
             current_filter = current_filter.set_to_block(calculate_process_historic_log_to_block(
                 &from_block,
@@ -71,7 +73,7 @@ pub fn fetch_logs_stream(
         }
 
         while current_filter.from_block() <= snapshot_to_block {
-            if !is_running() {
+            if !is_running() || config.cancel_token().is_cancelled() {
                 break;
             }
 
@@ -134,8 +136,10 @@ pub fn fetch_logs_stream(
                 &config.indexing_distance_from_head(),
                 current_filter,
                 &config.info_log_name(),
+                &config.network_contract().network,
                 config.network_contract().disable_logs_bloom_checks,
                 original_max_limit,
+                config.cancel_token().clone(),
             )
             .await;
         }
@@ -394,8 +398,10 @@ async fn live_indexing_stream(
     reorg_safe_distance: &U64,
     mut current_filter: RindexerEventFilter,
     info_log_name: &str,
+    network: &str,
     disable_logs_bloom_checks: bool,
     original_max_limit: Option<U64>,
+    cancel_token: CancellationToken,
 ) {
     let mut last_seen_block_number = last_seen_block_number;
     let mut log_response_to_large_to_block: Option<U64> = None;
@@ -408,10 +414,11 @@ async fn live_indexing_stream(
     // Spawn a separate task to handle notifications
     if let Some(notifications) = chain_state_notification {
         let info_log_name = info_log_name.to_string();
+        let network = network.to_string();
         tokio::spawn(async move {
             let mut notifications_clone = notifications.subscribe();
             while let Ok(notification) = notifications_clone.recv().await {
-                handle_chain_notification(notification, &info_log_name);
+                handle_chain_notification(notification, &info_log_name, &network);
             }
         });
     }
@@ -427,7 +434,7 @@ async fn live_indexing_stream(
     loop {
         let iteration_start = Instant::now();
 
-        if !is_running() {
+        if !is_running() || cancel_token.is_cancelled() {
             break;
         }
 
@@ -468,7 +475,7 @@ async fn live_indexing_stream(
                         let from_block = current_filter.from_block();
                         if from_block > safe_block_number {
                             if reorg_safe_distance.is_zero() {
-                                let block_distance = latest_block_number - from_block;
+                                let block_distance = from_block - latest_block_number;
                                 let is_outside_reorg_range = block_distance
                                     > reorg_safe_distance_for_chain(cached_provider.chain.id());
 
@@ -476,7 +483,7 @@ async fn live_indexing_stream(
                                 // therefore, we log an error as means RCP state is not in sync with the blockchain
                                 if is_outside_reorg_range {
                                     error!(
-                                        "{} - {} - LIVE INDEXING STEAM - RPC has gone back on latest block: rpc returned {}, last seen: {}",
+                                        "{} - {} - LIVE INDEXING STREAM - RPC has gone back on latest block: rpc returned {}, last seen: {}",
                                         info_log_name,
                                         IndexingEventProgressStatus::Live.log(),
                                         latest_block_number,
@@ -484,7 +491,7 @@ async fn live_indexing_stream(
                                     );
                                 } else {
                                     info!(
-                                        "{} - {} - LIVE INDEXING STEAM - RPC has gone back on latest block: rpc returned {}, last seen: {}",
+                                        "{} - {} - LIVE INDEXING STREAM - RPC has gone back on latest block: rpc returned {}, last seen: {}",
                                         info_log_name,
                                         IndexingEventProgressStatus::Live.log(),
                                         latest_block_number,
@@ -493,7 +500,7 @@ async fn live_indexing_stream(
                                 }
                             } else {
                                 info!(
-                                    "{} - {} - LIVE INDEXING STEAM - not in safe reorg block range yet block: {} > range: {}",
+                                    "{} - {} - LIVE INDEXING STREAM - not in safe reorg block range yet block: {} > range: {}",
                                     info_log_name,
                                     IndexingEventProgressStatus::Live.log(),
                                     from_block,

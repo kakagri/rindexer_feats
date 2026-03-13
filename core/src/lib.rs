@@ -1,22 +1,37 @@
 // public
+pub mod adaptive_concurrency;
 pub mod generator;
+pub mod hot_reload;
+pub use hot_reload::RELOAD_EXIT_CODE;
 pub mod indexer;
 pub mod layer_extensions;
 pub mod manifest;
+pub mod metrics;
 pub mod reth;
 
 mod system_state;
-pub use system_state::{initiate_shutdown, is_running};
+pub use system_state::{
+    get_reload_state, initiate_shutdown, is_running, set_reload_state, ReloadState,
+};
 
 mod health;
 pub use health::{start_health_server, HealthServer, HealthServerState, HealthStatus};
 
 mod database;
 pub use database::{
-    clickhouse::{client::ClickhouseClient, setup::setup_clickhouse},
+    clickhouse::{
+        client::ClickhouseClient,
+        schema_sync::{
+            apply_schema_change as apply_clickhouse_schema_change,
+            detect_schema_changes as detect_clickhouse_schema_changes,
+            SchemaChange as ClickhouseSchemaChange,
+        },
+        setup::setup_clickhouse,
+    },
     generate::drop_tables_for_indexer_sql,
     postgres::{
         client::{PostgresClient, ToSql},
+        schema_sync::{apply_schema_change, detect_schema_changes, SchemaChange},
         setup::setup_postgres,
     },
 };
@@ -47,11 +62,15 @@ mod start;
 mod streams;
 mod types;
 
+mod events;
+pub use events::{RindexerEvent, RindexerEventStream};
+
 // export 3rd party dependencies
 pub use async_trait::async_trait;
 pub use colored::Colorize as RindexerColorize;
 pub use database::sql_type_wrapper::EthereumSqlTypeWrapper;
 pub use futures::FutureExt;
+pub use indexer::no_code::resolve_table_column_types;
 pub use lazy_static::lazy_static;
 pub use reqwest::header::HeaderMap;
 pub use start::{

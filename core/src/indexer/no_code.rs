@@ -8,12 +8,13 @@ use alloy::{
     dyn_abi::DynSolValue,
     json_abi::{Event, JsonAbi},
 };
-use colored::Colorize;
 use serde_json::Value;
 use tokio_postgres::types::Type as PgType;
 use tracing::{debug, error, info, warn};
 
+use super::cron_scheduler::{manifest_has_cron_tables, CronScheduler};
 use super::native_transfer::{NATIVE_TRANSFER_ABI, NATIVE_TRANSFER_CONTRACT_NAME};
+use super::tables::{process_table_operations, ProgressCheckpointConfig, TableRuntime, TxMetadata};
 use crate::database::clickhouse::client::ClickhouseClient;
 use crate::database::clickhouse::setup::{setup_clickhouse, SetupClickhouseError};
 use crate::database::generate::{
@@ -23,6 +24,7 @@ use crate::database::sql_type_wrapper::{
     map_ethereum_wrapper_to_json, map_log_params_to_ethereum_wrapper, EthereumSqlTypeWrapper,
 };
 use crate::manifest::contract::Contract;
+use crate::manifest::core::Constants;
 use crate::{
     abi::{ABIItem, CreateCsvFileForEvent, EventInfo, ParamTypeError, ReadAbiError},
     chat::ChatClients,
@@ -81,6 +83,59 @@ pub enum SetupNoCodeError {
     NothingToStartNoCode,
 }
 
+/// Resolves column types in custom tables from the event ABI.
+/// This must be called before database table generation.
+#[allow(clippy::result_large_err)]
+pub fn resolve_table_column_types(
+    project_path: &Path,
+    manifest: &mut Manifest,
+) -> Result<(), SetupNoCodeError> {
+    for contract in &mut manifest.contracts {
+        if contract.tables.is_none() {
+            continue;
+        }
+
+        // Get ABI items to build event type map
+        let is_filter = contract.identify_and_modify_filter();
+        let abi_items = match ABIItem::get_abi_items(project_path, contract, is_filter) {
+            Ok(items) => items,
+            Err(e) => return Err(SetupNoCodeError::ProcessIndexersError(e.into())),
+        };
+        let event_infos = match ABIItem::extract_event_names_and_signatures_from_abi(abi_items) {
+            Ok(infos) => infos,
+            Err(e) => return Err(SetupNoCodeError::ProcessIndexersError(e.into())),
+        };
+
+        // Build event ABI types map
+        let event_abi_types: std::collections::HashMap<
+            String,
+            std::collections::HashMap<String, String>,
+        > = event_infos
+            .iter()
+            .map(|event_info| {
+                let column_types: std::collections::HashMap<String, String> = event_info
+                    .inputs
+                    .iter()
+                    .map(|input| (input.name.clone(), input.type_.clone()))
+                    .collect();
+                (event_info.name.clone(), column_types)
+            })
+            .collect();
+
+        // Resolve column types in custom tables
+        if let Some(tables) = &mut contract.tables {
+            for table in tables.iter_mut() {
+                if let Err(e) = table.resolve_column_types(&event_abi_types) {
+                    return Err(SetupNoCodeError::ProcessIndexersError(
+                        ProcessIndexersError::TableColumnTypeResolutionError(e),
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 pub async fn setup_no_code(
     details: StartNoCodeDetails<'_>,
 ) -> Result<StartDetails<'_>, SetupNoCodeError> {
@@ -95,6 +150,14 @@ pub async fn setup_no_code(
             setup_info_logger();
 
             info!("Starting rindexer no code");
+
+            // Configure view call concurrency limit if specified
+            if let Some(limit) = manifest.config.max_concurrent_view_calls {
+                crate::indexer::tables::configure_view_call_limit(limit).await;
+            }
+
+            // Resolve table column types from ABI before database setup
+            resolve_table_column_types(project_path, &mut manifest)?;
 
             let mut postgres: Option<Arc<PostgresClient>> = None;
             if manifest.storage.postgres_enabled() {
@@ -111,6 +174,8 @@ pub async fn setup_no_code(
                     manifest_path: details.manifest_path,
                     indexing_details: None,
                     graphql_details: details.graphql_details,
+                    cron_scheduler_handle: None,
+                    watch: details.watch,
                 });
             }
 
@@ -147,8 +212,8 @@ pub async fn setup_no_code(
             let trace_events = process_trace_events(
                 project_path,
                 &mut manifest,
-                postgres,
-                clickhouse,
+                postgres.clone(),
+                clickhouse.clone(),
                 &network_providers,
             )
             .await?;
@@ -160,18 +225,66 @@ pub async fn setup_no_code(
                     manifest
                         .native_transfers
                         .networks
+                        .as_ref()
+                        .map(|nets| nets.iter().map(|n| n.network.clone()).collect::<Vec<_>>())
                         .unwrap_or_default()
-                        .iter()
-                        .map(|network| network.network.clone())
-                        .collect::<Vec<String>>()
                         .join(", ")
                 );
             }
 
+            // Start cron scheduler if any tables have cron triggers
+            if manifest_has_cron_tables(&manifest) {
+                let providers_map: Arc<
+                    std::collections::HashMap<String, Arc<crate::provider::JsonRpcCachedProvider>>,
+                > = Arc::new(
+                    network_providers
+                        .iter()
+                        .map(|p| (p.network_name.clone(), p.client.clone()))
+                        .collect(),
+                );
+
+                let scheduler = CronScheduler::new(
+                    &manifest,
+                    postgres.clone(),
+                    clickhouse.clone(),
+                    providers_map,
+                );
+
+                let cron_scheduler_handle = if scheduler.has_tasks() {
+                    info!("Starting cron scheduler with {} tasks", scheduler.tasks.len());
+                    Some(tokio::spawn(async move {
+                        scheduler.run().await.map_err(|e| {
+                            error!("Cron scheduler error: {}", e);
+                            e.to_string()
+                        })
+                    }))
+                } else {
+                    None
+                };
+
+                return Ok(StartDetails {
+                    manifest_path: details.manifest_path,
+                    indexing_details: Some(IndexingDetails {
+                        registry,
+                        trace_registry,
+                        event_stream: None,
+                    }),
+                    graphql_details: details.graphql_details,
+                    cron_scheduler_handle,
+                    watch: details.watch,
+                });
+            }
+
             Ok(StartDetails {
                 manifest_path: details.manifest_path,
-                indexing_details: Some(IndexingDetails { registry, trace_registry }),
+                indexing_details: Some(IndexingDetails {
+                    registry,
+                    trace_registry,
+                    event_stream: None,
+                }),
                 graphql_details: details.graphql_details,
+                cron_scheduler_handle: None,
+                watch: details.watch,
             })
         }
         None => Err(SetupNoCodeError::NoProjectPathFoundUsingParentOfManifestPath),
@@ -193,6 +306,17 @@ struct NoCodeCallbackParams {
     clickhouse: Option<Arc<ClickhouseClient>>,
     streams_clients: Arc<Option<StreamsClients>>,
     chat_clients: Arc<Option<ChatClients>>,
+    /// Custom tables for aggregation operations
+    tables: Arc<Vec<TableRuntime>>,
+    /// Whether to store raw events in the event table.
+    /// False when event is only used for custom tables (not in include_events).
+    store_raw_events: bool,
+    /// RPC providers for view calls in custom tables (keyed by network name)
+    providers: Arc<std::collections::HashMap<String, Arc<crate::provider::JsonRpcCachedProvider>>>,
+    /// User-defined constants from the manifest (can be network-scoped)
+    constants: Arc<Constants>,
+    /// Custom Multicall3 addresses per network (keyed by network name)
+    multicall_addresses: Arc<std::collections::HashMap<String, Option<String>>>,
 }
 
 struct EventCallbacks {
@@ -213,10 +337,7 @@ fn no_code_callback(params: Arc<NoCodeCallbackParams>) -> EventCallbacks {
             if event_length == 0 {
                 debug!(
                     "{} {}: {} - {}",
-                    params.indexer_name,
-                    params.contract_name,
-                    params.event_info.name,
-                    "NO EVENTS".red()
+                    params.indexer_name, params.contract_name, params.event_info.name, "NO EVENTS"
                 );
 
                 return Ok(());
@@ -272,6 +393,13 @@ fn no_code_callback(params: Arc<NoCodeCallbackParams>) -> EventCallbacks {
 
             // stream and chat info
             let mut event_message_data: Vec<Value> = Vec::new();
+
+            // table operations data: (log_params, network, tx_metadata)
+            let mut table_events_data: Vec<(
+                Vec<crate::types::core::LogParam>,
+                String,
+                TxMetadata,
+            )> = Vec::new();
 
             let owned_results = match &results {
                 CallbackResult::Event(events) => events
@@ -455,57 +583,112 @@ fn no_code_callback(params: Arc<NoCodeCallbackParams>) -> EventCallbacks {
                     csv_data.push(format!("{transaction_hash:?}"));
                     csv_data.push(format!("{block_number:?}"));
                     csv_data.push(format!("{block_hash:?}"));
-                    csv_data.push(network);
+                    csv_data.push(network.clone());
 
                     csv_bulk_data.push(csv_data);
+                }
+
+                // Collect data for table operations
+                if !params.tables.is_empty() {
+                    let tx_metadata = TxMetadata {
+                        block_number,
+                        block_timestamp,
+                        tx_hash: transaction_hash,
+                        block_hash,
+                        contract_address: address,
+                        log_index,
+                        tx_index: transaction_index,
+                    };
+                    table_events_data.push((log_params, network, tx_metadata));
                 }
 
                 indexed_count += 1;
             }
 
-            if let Some(postgres) = &params.postgres {
-                if !sql_bulk_data.is_empty() {
-                    if let Err(e) = postgres
-                        .insert_bulk(
-                            &params.sql_event_table_name,
-                            &params.sql_column_names,
-                            &sql_bulk_data,
-                        )
-                        .await
-                    {
-                        error!(
-                            "{}::{} - Error performing postgres bulk insert: {}",
-                            params.contract_name, params.event_info.name, e
-                        );
-                        return Err(e.to_string());
+            // Only store raw events if include_events was specified for this event
+            if params.store_raw_events {
+                if let Some(postgres) = &params.postgres {
+                    if !sql_bulk_data.is_empty() {
+                        if let Err(e) = postgres
+                            .insert_bulk(
+                                &params.sql_event_table_name,
+                                &params.sql_column_names,
+                                &sql_bulk_data,
+                            )
+                            .await
+                        {
+                            error!(
+                                "{}::{} - Error performing postgres bulk insert: {}",
+                                params.contract_name, params.event_info.name, e
+                            );
+                            return Err(e.to_string());
+                        }
+                    }
+                }
+
+                if let Some(clickhouse) = &params.clickhouse {
+                    if !sql_bulk_data.is_empty() {
+                        if let Err(e) = clickhouse
+                            .insert_bulk(
+                                &params.sql_event_table_name,
+                                &params.sql_column_names,
+                                &sql_bulk_data,
+                            )
+                            .await
+                        {
+                            error!(
+                                "{}::{} - Error performing clickhouse bulk insert: {}",
+                                params.contract_name, params.event_info.name, e
+                            );
+                            return Err(e.to_string());
+                        };
+                    }
+                }
+
+                if let Some(csv) = &params.csv {
+                    if !csv_bulk_data.is_empty() {
+                        if let Err(e) = csv.append_bulk(csv_bulk_data).await {
+                            return Err(e.to_string());
+                        }
                     }
                 }
             }
 
-            if let Some(clickhouse) = &params.clickhouse {
-                if !sql_bulk_data.is_empty() {
-                    if let Err(e) = clickhouse
-                        .insert_bulk(
-                            &params.clickhouse_table_name,
-                            &params.sql_column_names,
-                            &sql_bulk_data,
-                        )
-                        .await
-                    {
+            // Process table operations
+            if !params.tables.is_empty() && !table_events_data.is_empty() {
+                // Create checkpoint config for saving progress on shutdown
+                let checkpoint_config = ProgressCheckpointConfig::new(
+                    params.indexer_name.clone(),
+                    params.contract_name.clone(),
+                    params.event_info.name.clone(),
+                    params.postgres.clone(),
+                );
+                if let Err(e) = process_table_operations(
+                    &params.tables,
+                    &params.event_info.name,
+                    &table_events_data,
+                    params.postgres.clone(),
+                    params.clickhouse.clone(),
+                    params.providers.clone(),
+                    &params.constants,
+                    &params.multicall_addresses,
+                    Some(&checkpoint_config),
+                )
+                .await
+                {
+                    // Don't log as error if it's a graceful shutdown
+                    if e.contains("Shutdown") {
+                        info!(
+                            "{}::{} - Graceful shutdown during table processing",
+                            params.contract_name, params.event_info.name
+                        );
+                    } else {
                         error!(
-                            "{}::{} - Error performing clickhouse bulk insert: {}",
+                            "{}::{} - Error processing table operations: {}",
                             params.contract_name, params.event_info.name, e
                         );
-                        return Err(e.to_string());
-                    };
-                }
-            }
-
-            if let Some(csv) = &params.csv {
-                if !csv_bulk_data.is_empty() {
-                    if let Err(e) = csv.append_bulk(csv_bulk_data).await {
-                        return Err(e.to_string());
                     }
+                    return Err(e);
                 }
             }
 
@@ -537,7 +720,7 @@ fn no_code_callback(params: Arc<NoCodeCallbackParams>) -> EventCallbacks {
                                 "{}::{} - {} - {} events {}",
                                 params.contract_name,
                                 params.event_info.name,
-                                "STREAMED".green(),
+                                "STREAMED",
                                 streamed,
                                 format!(
                                     "- blocks: {} - {} - network: {}",
@@ -559,7 +742,7 @@ fn no_code_callback(params: Arc<NoCodeCallbackParams>) -> EventCallbacks {
                         "{}::{} - {} - messages has a max 10 block range due the rate limits - {}",
                         params.contract_name,
                         params.event_info.name,
-                        "CHAT_MESSAGES_DISABLED".yellow(),
+                        "CHAT_MESSAGES_DISABLED",
                         format!("- blocks: {} - {} - network: {}", from_block, to_block, network)
                     );
                 } else {
@@ -578,7 +761,7 @@ fn no_code_callback(params: Arc<NoCodeCallbackParams>) -> EventCallbacks {
                                     "{}::{} - {} - {} events {}",
                                     params.contract_name,
                                     params.event_info.name,
-                                    "CHAT_MESSAGES_SENT".green(),
+                                    "CHAT_MESSAGES_SENT",
                                     messages_sent,
                                     format!(
                                         "- blocks: {} - {} - network: {}",
@@ -599,7 +782,7 @@ fn no_code_callback(params: Arc<NoCodeCallbackParams>) -> EventCallbacks {
                 "{}::{} - {} - {} events {}",
                 params.contract_name,
                 params.event_info.name,
-                "INDEXED".green(),
+                "INDEXED",
                 indexed_count,
                 format!("- blocks: {} - {} - network: {}", from_block, to_block, network)
             );
@@ -651,6 +834,9 @@ pub enum ProcessIndexersError {
 
     #[error("{0}")]
     ParseAbiError(#[from] ParseAbiError),
+
+    #[error("Table column type resolution error: {0}")]
+    TableColumnTypeResolutionError(String),
 }
 
 pub async fn process_events(
@@ -690,6 +876,18 @@ async fn process_contract(
     if contract.name.to_lowercase() == NATIVE_TRANSFER_CONTRACT_NAME.to_lowercase() {
         return Err(ProcessIndexersError::ContractNameConflict(contract.name.to_string()));
     }
+
+    // Build providers map for view calls
+    let providers: Arc<
+        std::collections::HashMap<String, Arc<crate::provider::JsonRpcCachedProvider>>,
+    > = Arc::new(
+        network_providers.iter().map(|p| (p.network_name.clone(), p.client.clone())).collect(),
+    );
+
+    // Build multicall3 addresses map from network configs
+    let multicall_addresses: Arc<std::collections::HashMap<String, Option<String>>> = Arc::new(
+        manifest.networks.iter().map(|n| (n.name.clone(), n.multicall3_address.clone())).collect(),
+    );
 
     // TODO - this could be shared with `get_abi_items`
     let abi_str = contract.parse_abi(project_path)?;
@@ -775,6 +973,22 @@ async fn process_contract(
             .as_ref()
             .is_some_and(|vec| vec.contains(&event_info.name));
 
+        // Build custom tables for this contract
+        let contract_tables: Vec<TableRuntime> = contract
+            .tables
+            .as_ref()
+            .map(|tables| {
+                tables
+                    .iter()
+                    .map(|table| TableRuntime::new(table.clone(), &manifest.name, &contract.name))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        // Determine if this event should store raw events
+        // Only store raw events if the event is explicitly in include_events
+        let store_raw_events = contract.is_event_in_include_events(&event_name);
+
         let event = EventCallbackRegistryInformation {
             id: generate_random_id(10),
             indexer_name: manifest.name.clone(),
@@ -796,6 +1010,11 @@ async fn process_contract(
                 sql_column_names,
                 streams_clients: Arc::new(streams_client),
                 chat_clients: Arc::new(chat_clients),
+                tables: Arc::new(contract_tables),
+                store_raw_events,
+                providers: providers.clone(),
+                constants: Arc::new(manifest.constants.clone()),
+                multicall_addresses: multicall_addresses.clone(),
             }))
             .event_callback,
         };
@@ -902,6 +1121,22 @@ pub async fn process_trace_events(
             None
         };
 
+        // Build providers map for view calls (native transfers don't use them but need for struct)
+        let providers: Arc<
+            std::collections::HashMap<String, Arc<crate::provider::JsonRpcCachedProvider>>,
+        > = Arc::new(
+            network_providers.iter().map(|p| (p.network_name.clone(), p.client.clone())).collect(),
+        );
+
+        // Build multicall3 addresses map from network configs
+        let multicall_addresses: Arc<std::collections::HashMap<String, Option<String>>> = Arc::new(
+            manifest
+                .networks
+                .iter()
+                .map(|n| (n.name.clone(), n.multicall3_address.clone()))
+                .collect(),
+        );
+
         let callback_params = Arc::new(NoCodeCallbackParams {
             event_info: event_info.clone(),
             indexer_name: manifest.name.clone(),
@@ -916,6 +1151,11 @@ pub async fn process_trace_events(
             sql_column_names,
             streams_clients: Arc::new(streams_client),
             chat_clients: Arc::new(chat_clients),
+            tables: Arc::new(Vec::new()), // Native transfers don't support custom tables
+            store_raw_events: true,       // Native transfers always store raw events
+            providers,
+            constants: Arc::new(manifest.constants.clone()),
+            multicall_addresses,
         });
 
         let event = TraceCallbackRegistryInformation {

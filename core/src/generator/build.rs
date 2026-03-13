@@ -434,6 +434,7 @@ pub enum GenerateError {
 }
 
 /// Generates all the rindexer project typings and handlers
+#[allow(clippy::result_large_err)]
 pub fn generate_rindexer_typings_and_handlers(
     manifest_location: &PathBuf,
 ) -> Result<(), GenerateError> {
@@ -475,6 +476,7 @@ pub enum GenerateRustProjectError {
     GenerateError(#[from] GenerateError),
 }
 
+#[allow(clippy::result_large_err)]
 pub fn generate_rust_project(
     project_path: &Path,
     is_reth_project: bool,
@@ -498,7 +500,7 @@ edition = "2021"
 [dependencies]
 rindexer = {{ git = "https://github.com/joshstevens19/rindexer", branch = "master" {reth_dep}}}
 tokio = {{ version = "1", features = ["full"] }}
-alloy = {{ version = "1.0.37", features = ["full"] }}
+alloy = {{ version = "1.0.41", features = ["full"] }}
 serde = {{ version = "1.0", features = ["derive"] }}
 "#,
         project_name = manifest.name,
@@ -566,6 +568,7 @@ serde = {{ version = "1.0", features = ["derive"] }}
                                 Some(IndexingDetails {
                                     registry: register_all_handlers(&manifest_path).await,
                                     trace_registry: TraceCallbackRegistry { events: vec![] },
+                                    event_stream: None,
                                 })
                             } else {
                                 None
@@ -573,7 +576,8 @@ serde = {{ version = "1.0", features = ["derive"] }}
                             graphql_details: GraphqlOverrideSettings {
                                 enabled: enable_graphql,
                                 override_port: port,
-                            }
+                            },
+                            cron_scheduler_handle: None,
                         })
                         .await;
 
